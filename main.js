@@ -17,6 +17,8 @@ let formationStart = 0;
 const formationDuration = 3000; // ms
 let formationDone = false;
 let helpersAdded = false;
+let gridHelper = null;
+let axesHelper = null;
 
 // UI params
 const params = {
@@ -24,7 +26,13 @@ const params = {
     pointSize: 0.01,
     color: '#ff8800',
     walkSpeed: 0, // set after camera init
+    pauseWalk: false,
+    rotationSpeed: 0.0, // rad/s applied to tiger (not group yaw)
+    showGrid: true,
+    explode: 0.0, // 0 formed .. 1 fully exploded
 };
+
+const pose = { x: 0, y: 0, z: 0, yawDeg: 0 };
 
 function init() {
     scene = new THREE.Scene();
@@ -113,13 +121,15 @@ function init() {
 
         // Add ground grid and axes once sized
         if (!helpersAdded) {
-            const grid = new THREE.GridHelper(maxDim * 2, 40, 0x444444, 0x222222);
-            grid.position.y = 0;
-            scene.add(grid);
-            const axes = new THREE.AxesHelper(maxDim * 0.6);
-            scene.add(axes);
+            gridHelper = new THREE.GridHelper(maxDim * 2, 40, 0x444444, 0x222222);
+            gridHelper.position.y = 0;
+            scene.add(gridHelper);
+            axesHelper = new THREE.AxesHelper(maxDim * 0.6);
+            scene.add(axesHelper);
             helpersAdded = true;
         }
+        if (gridHelper) gridHelper.visible = params.showGrid;
+        if (axesHelper) axesHelper.visible = params.showGrid;
 
         // Store original vertices (targets) for wobble/formation
         const posAttr = tiger.geometry.getAttribute('position');
@@ -185,71 +195,76 @@ function animate() {
     const dt = clock.getDelta();
 
     if (tiger) {
-        // Formation animation to converge from far away to original
+        // Formation + explode control combined as an "effective explode factor"
         const posAttr = tiger.geometry.getAttribute('position');
         const arr = posAttr.array;
+        let e = 1; // formation progress 0..1
         if (!formationDone && startVertices) {
             const t = Math.min(1, (performance.now() - formationStart) / formationDuration);
-            // easeOutCubic
-            const e = 1 - Math.pow(1 - t, 3);
+            e = 1 - Math.pow(1 - t, 3); // easeOutCubic
+            if (t >= 1) formationDone = true;
+        }
+        const formationExplode = 1 - e; // 1 at start, 0 when formed
+        const fEff = Math.max(formationExplode, params.explode);
+
+        // Update positions toward base (lerp of original and start)
+        let updated = false;
+        if (hoverPointLocal) {
+            const hx = hoverPointLocal.x;
+            const hy = hoverPointLocal.y;
+            const hz = hoverPointLocal.z;
+            const r2 = hoverRadius * hoverRadius;
             for (let i = 0; i < arr.length; i += 3) {
-                const sx = startVertices[i];
-                const sy = startVertices[i + 1];
-                const sz = startVertices[i + 2];
                 const ox = originalVertices[i];
                 const oy = originalVertices[i + 1];
                 const oz = originalVertices[i + 2];
-                const bx = sx + (ox - sx) * e;
-                const by = sy + (oy - sy) * e;
-                const bz = sz + (oz - sz) * e;
-                arr[i] = bx;
-                arr[i + 1] = by;
-                arr[i + 2] = bz;
+                const sx = startVertices ? startVertices[i] : ox;
+                const sy = startVertices ? startVertices[i + 1] : oy;
+                const sz = startVertices ? startVertices[i + 2] : oz;
+                const bx = ox + (sx - ox) * fEff;
+                const by = oy + (sy - oy) * fEff;
+                const bz = oz + (sz - oz) * fEff;
+                const dx = bx - hx;
+                const dy = by - hy;
+                const dz = bz - hz;
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < r2) {
+                    const d = Math.sqrt(Math.max(d2, 1e-6));
+                    const falloff = 1 - d / hoverRadius; // 0..1
+                    const amp = wobbleIntensity * falloff * falloff;
+                    arr[i] = bx + (Math.random() - 0.5) * amp;
+                    arr[i + 1] = by + (Math.random() - 0.5) * amp;
+                    arr[i + 2] = bz + (Math.random() - 0.5) * amp;
+                } else {
+                    // Relax toward base
+                    arr[i] += (bx - arr[i]) * Math.min(1, dt * 10);
+                    arr[i + 1] += (by - arr[i + 1]) * Math.min(1, dt * 10);
+                    arr[i + 2] += (bz - arr[i + 2]) * Math.min(1, dt * 10);
+                }
             }
-            posAttr.needsUpdate = true;
-            if (t >= 1) formationDone = true;
+            updated = true;
+        } else {
+            for (let i = 0; i < arr.length; i += 3) {
+                const ox = originalVertices[i];
+                const oy = originalVertices[i + 1];
+                const oz = originalVertices[i + 2];
+                const sx = startVertices ? startVertices[i] : ox;
+                const sy = startVertices ? startVertices[i + 1] : oy;
+                const sz = startVertices ? startVertices[i + 2] : oz;
+                const bx = ox + (sx - ox) * fEff;
+                const by = oy + (sy - oy) * fEff;
+                const bz = oz + (sz - oz) * fEff;
+                arr[i] += (bx - arr[i]) * Math.min(1, dt * 10);
+                arr[i + 1] += (by - arr[i + 1]) * Math.min(1, dt * 10);
+                arr[i + 2] += (bz - arr[i + 2]) * Math.min(1, dt * 10);
+            }
+            updated = true;
         }
+        if (updated) posAttr.needsUpdate = true;
 
-        // Localized wobble around hover point (after formation)
-        if (formationDone) {
-            let updated = false;
-            if (hoverPointLocal) {
-                const hx = hoverPointLocal.x;
-                const hy = hoverPointLocal.y;
-                const hz = hoverPointLocal.z;
-                const r2 = hoverRadius * hoverRadius;
-                for (let i = 0; i < arr.length; i += 3) {
-                    const ox = originalVertices[i];
-                    const oy = originalVertices[i + 1];
-                    const oz = originalVertices[i + 2];
-                    const dx = ox - hx;
-                    const dy = oy - hy;
-                    const dz = oz - hz;
-                    const d2 = dx * dx + dy * dy + dz * dz;
-                    if (d2 < r2) {
-                        const d = Math.sqrt(d2);
-                        const falloff = 1 - d / hoverRadius; // 0..1
-                        const amp = wobbleIntensity * falloff * falloff;
-                        arr[i] = ox + (Math.random() - 0.5) * amp;
-                        arr[i + 1] = oy + (Math.random() - 0.5) * amp;
-                        arr[i + 2] = oz + (Math.random() - 0.5) * amp;
-                        updated = true;
-                    } else {
-                        // Relax back to original
-                        arr[i] += (originalVertices[i] - arr[i]) * Math.min(1, dt * 10);
-                        arr[i + 1] += (originalVertices[i + 1] - arr[i + 1]) * Math.min(1, dt * 10);
-                        arr[i + 2] += (originalVertices[i + 2] - arr[i + 2]) * Math.min(1, dt * 10);
-                        updated = true;
-                    }
-                }
-            } else {
-                // No hover: relax all back to original smoothly
-                for (let i = 0; i < arr.length; i++) {
-                    arr[i] += (originalVertices[i] - arr[i]) * Math.min(1, dt * 10);
-                }
-                updated = true;
-            }
-            if (updated) posAttr.needsUpdate = true;
+        // Optional independent rotation animation (about local Y)
+        if (params.rotationSpeed) {
+            tiger.rotation.y += params.rotationSpeed * dt;
         }
     }
 
@@ -263,7 +278,9 @@ function animate() {
         }
         // sync with UI-updated speed
         walkSpeed = params.walkSpeed;
-        tigerGroup.position.x += walkDirection * walkSpeed * dt;
+        if (!params.pauseWalk) {
+            tigerGroup.position.x += walkDirection * walkSpeed * dt;
+        }
         if (tigerGroup.position.x > walkRange) {
             walkDirection = -1;
             tigerGroup.position.x = walkRange;
@@ -273,6 +290,14 @@ function animate() {
             tigerGroup.position.x = -walkRange;
             tigerGroup.rotation.y = 0;
         }
+    }
+
+    // Update pose monitors
+    if (tigerGroup) {
+        pose.x = tigerGroup.position.x;
+        pose.y = tigerGroup.position.y;
+        pose.z = tigerGroup.position.z;
+        pose.yawDeg = THREE.MathUtils.radToDeg(tigerGroup.rotation.y) % 360;
     }
 
     if (controls) controls.update();
@@ -357,6 +382,28 @@ function setupGUI(mergedGeometry) {
     gui.add(params, 'walkSpeed', 0, 10, 0.1)
         .name('Walk Speed')
         .onChange((v) => { params.walkSpeed = v; });
+
+    gui.add(params, 'pauseWalk')
+        .name('Pause Walk');
+
+    gui.add(params, 'rotationSpeed', 0, 2, 0.01)
+        .name('Rotation Speed');
+
+    gui.add(params, 'explode', 0, 1, 0.01)
+        .name('Explode');
+
+    gui.add(params, 'showGrid')
+        .name('Show Grid/Axes')
+        .onChange((v) => {
+            if (gridHelper) gridHelper.visible = v;
+            if (axesHelper) axesHelper.visible = v;
+        });
+
+    const poseFolder = gui.addFolder('Pose (read-only)');
+    poseFolder.add(pose, 'x').name('X').listen();
+    poseFolder.add(pose, 'y').name('Y').listen();
+    poseFolder.add(pose, 'z').name('Z').listen();
+    poseFolder.add(pose, 'yawDeg').name('Yaw (deg)').listen();
 }
 
 function onDocumentMouseMove(event) {
