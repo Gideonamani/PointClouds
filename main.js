@@ -19,6 +19,8 @@ let formationDone = false;
 let helpersAdded = false;
 let gridHelper = null;
 let axesHelper = null;
+let rotationAxisLine = null;
+let baseMergedGeometry = null; // before orientation/alignment
 
 // UI params
 const params = {
@@ -30,6 +32,9 @@ const params = {
     rotationSpeed: 0.0, // rad/s applied to tiger (not group yaw)
     showGrid: true,
     explode: 0.0, // 0 formed .. 1 fully exploded
+    showRotationAxis: true,
+    modelUp: '+Y',
+    modelForward: '+X',
 };
 
 const pose = { x: 0, y: 0, z: 0, yawDeg: 0 };
@@ -74,18 +79,13 @@ function init() {
             return;
         }
 
-        const merged = mergeBufferGeometries(geometries, false);
-        merged.computeBoundingBox();
-        const box = merged.boundingBox;
+        baseMergedGeometry = mergeBufferGeometries(geometries, false);
+        // Apply orientation correction and align to datum
+        const oriented = orientAndAlign(baseMergedGeometry);
+        oriented.computeBoundingBox();
+        const box = oriented.boundingBox;
         const size = new THREE.Vector3();
         box.getSize(size);
-        const center = new THREE.Vector3();
-        box.getCenter(center);
-        // Align to datum: center X/Z at 0, place base on ground (Y=0)
-        const tx = -center.x;
-        const ty = -box.min.y;
-        const tz = -center.z;
-        merged.translate(tx, ty, tz);
 
         const maxDim = Math.max(size.x, size.y, size.z);
         // Default visual scale
@@ -100,7 +100,7 @@ function init() {
         });
 
         // Build initial sampled point cloud for adjustable density
-        const sampled = samplePointsFromGeometry(merged, params.pointCount);
+        const sampled = samplePointsFromGeometry(oriented, params.pointCount);
         tiger = new THREE.Points(sampled, material);
         tigerGroup = new THREE.Group();
         tigerGroup.add(tiger);
@@ -166,7 +166,10 @@ function init() {
         params.walkSpeed = (camera.position.z * 0.6) / 8; // cross ~8s by default
 
         // Build UI
-        setupGUI(merged);
+        setupGUI(baseMergedGeometry);
+
+        // Create rotation axis visualization
+        createOrUpdateRotationAxisLine();
 
     }, undefined, (error) => {
         console.error("Error loading tiger model:", error);
@@ -321,12 +324,14 @@ function samplePointsFromGeometry(geometry, count) {
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geom.computeBoundingBox();
+    geom.computeBoundingSphere();
     return geom;
 }
 
 function rebuildPointCloud(mergedGeometry) {
     if (!tiger) return;
-    const newGeom = samplePointsFromGeometry(mergedGeometry, params.pointCount);
+    const oriented = orientAndAlign(mergedGeometry);
+    const newGeom = samplePointsFromGeometry(oriented, params.pointCount);
     // Dispose old geometry to free memory
     tiger.geometry.dispose();
     tiger.geometry = newGeom;
@@ -353,6 +358,9 @@ function rebuildPointCloud(mergedGeometry) {
     posAttr.needsUpdate = true;
     formationStart = performance.now();
     formationDone = false;
+
+    // update rotation axis line for new size
+    createOrUpdateRotationAxisLine();
 }
 
 function setupGUI(mergedGeometry) {
@@ -399,11 +407,101 @@ function setupGUI(mergedGeometry) {
             if (axesHelper) axesHelper.visible = v;
         });
 
+    gui.add(params, 'showRotationAxis')
+        .name('Show Rotation Axis')
+        .onChange((v) => { if (rotationAxisLine) rotationAxisLine.visible = v; });
+
+    const orientFolder = gui.addFolder('Orientation');
+    orientFolder.add(params, 'modelUp', ['+X','-X','+Y','-Y','+Z','-Z'])
+        .name('Model Up')
+        .onFinishChange(() => rebuildPointCloud(mergedGeometry));
+    orientFolder.add(params, 'modelForward', ['+X','-X','+Y','-Y','+Z','-Z'])
+        .name('Model Forward')
+        .onFinishChange(() => rebuildPointCloud(mergedGeometry));
+
     const poseFolder = gui.addFolder('Pose (read-only)');
     poseFolder.add(pose, 'x').name('X').listen();
     poseFolder.add(pose, 'y').name('Y').listen();
     poseFolder.add(pose, 'z').name('Z').listen();
     poseFolder.add(pose, 'yawDeg').name('Yaw (deg)').listen();
+}
+
+function axisStringToVector(s) {
+    switch (s) {
+        case '+X': return new THREE.Vector3(1,0,0);
+        case '-X': return new THREE.Vector3(-1,0,0);
+        case '+Y': return new THREE.Vector3(0,1,0);
+        case '-Y': return new THREE.Vector3(0,-1,0);
+        case '+Z': return new THREE.Vector3(0,0,1);
+        case '-Z': return new THREE.Vector3(0,0,-1);
+        default: return new THREE.Vector3(0,1,0);
+    }
+}
+
+function orientAndAlign(geometry) {
+    const g = geometry.clone();
+    // Build basis mapping from model (up/forward) to world (up=+Y, fwd=+X)
+    const u_m = axisStringToVector(params.modelUp).clone().normalize();
+    const f_m = axisStringToVector(params.modelForward).clone().normalize();
+    // Orthonormalize: ensure forward is perpendicular to up
+    const r_m = new THREE.Vector3().crossVectors(f_m, u_m).normalize();
+    const f_m_ortho = new THREE.Vector3().crossVectors(u_m, r_m).normalize();
+
+    const u_w = new THREE.Vector3(0,1,0);
+    const f_w = new THREE.Vector3(1,0,0);
+    const r_w = new THREE.Vector3().crossVectors(f_w, u_w).normalize();
+
+    const m_m = new THREE.Matrix3(); // columns = r,u,f
+    m_m.set(
+        r_m.x, u_m.x, f_m_ortho.x,
+        r_m.y, u_m.y, f_m_ortho.y,
+        r_m.z, u_m.z, f_m_ortho.z,
+    );
+    const m_w = new THREE.Matrix3();
+    m_w.set(
+        r_w.x, u_w.x, f_w.x,
+        r_w.y, u_w.y, f_w.y,
+        r_w.z, u_w.z, f_w.z,
+    );
+    const rot3 = new THREE.Matrix3().multiplyMatrices(m_w, m_m.clone().transpose());
+    const rot4 = new THREE.Matrix4().setFromMatrix3(rot3);
+    g.applyMatrix4(rot4);
+
+    // Align to datum: base on Y=0, center X/Z
+    g.computeBoundingBox();
+    const box = g.boundingBox;
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    g.translate(-center.x, -box.min.y, -center.z);
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+    return g;
+}
+
+function createOrUpdateRotationAxisLine() {
+    if (!tiger) return;
+    const bbox = tiger.geometry.boundingBox;
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+    const L = Math.max(size.x, size.y, size.z) * 1.2;
+
+    if (!rotationAxisLine) {
+        const geo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, -L, 0),
+            new THREE.Vector3(0,  L, 0),
+        ]);
+        const mat = new THREE.LineDashedMaterial({ color: 0xffffff, dashSize: 0.1 * L, gapSize: 0.05 * L });
+        rotationAxisLine = new THREE.Line(geo, mat);
+        rotationAxisLine.computeLineDistances();
+        tiger.add(rotationAxisLine);
+    } else {
+        const pos = rotationAxisLine.geometry.getAttribute('position');
+        pos.setXYZ(0, 0, -L, 0);
+        pos.setXYZ(1, 0,  L, 0);
+        pos.needsUpdate = true;
+        rotationAxisLine.computeLineDistances();
+    }
+    rotationAxisLine.visible = params.showRotationAxis;
 }
 
 function onDocumentMouseMove(event) {
@@ -417,10 +515,8 @@ function onDocumentMouseMove(event) {
 
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(mouse, camera);
-    // Tune hit test size relative to point size
-    raycaster.params.Points.threshold = tiger && tiger.material && tiger.material.size
-        ? tiger.material.size * 1.5
-        : 0.1;
+    // Use world-space hover radius for hit testing to match wobble area
+    raycaster.params.Points.threshold = Math.max(hoverRadius, 0.01);
 
     const intersects = raycaster.intersectObject(tiger);
     if (intersects.length > 0) {
