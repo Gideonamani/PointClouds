@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeBufferGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
 
 let scene, camera, renderer, controls, tiger, tigerGroup;
 let originalVertices = [];
@@ -14,6 +16,15 @@ const clock = new THREE.Clock();
 let formationStart = 0;
 const formationDuration = 3000; // ms
 let formationDone = false;
+let helpersAdded = false;
+
+// UI params
+const params = {
+    pointCount: 30000,
+    pointSize: 0.01,
+    color: '#ff8800',
+    walkSpeed: 0, // set after camera init
+};
 
 function init() {
     scene = new THREE.Scene();
@@ -62,19 +73,27 @@ function init() {
         box.getSize(size);
         const center = new THREE.Vector3();
         box.getCenter(center);
-        // Center geometry at origin for easy framing/controls
-        merged.translate(-center.x, -center.y, -center.z);
+        // Align to datum: center X/Z at 0, place base on ground (Y=0)
+        const tx = -center.x;
+        const ty = -box.min.y;
+        const tz = -center.z;
+        merged.translate(tx, ty, tz);
 
         const maxDim = Math.max(size.x, size.y, size.z);
-        // Thinner points
+        // Default visual scale
         const pointSize = Math.max(maxDim * 0.0015, 0.0025);
+        params.pointSize = pointSize;
+        params.pointCount = Math.min(60000, Math.max(8000, Math.floor((size.x * size.y + size.z * size.x + size.y * size.z) * 120)));
+
         const material = new THREE.PointsMaterial({
-            color: 0xff8800,
-            size: pointSize,
+            color: new THREE.Color(params.color),
+            size: params.pointSize,
             sizeAttenuation: true
         });
 
-        tiger = new THREE.Points(merged, material);
+        // Build initial sampled point cloud for adjustable density
+        const sampled = samplePointsFromGeometry(merged, params.pointCount);
+        tiger = new THREE.Points(sampled, material);
         tigerGroup = new THREE.Group();
         tigerGroup.add(tiger);
         scene.add(tigerGroup);
@@ -90,6 +109,16 @@ function init() {
         if (controls) {
             controls.target.set(0, 0, 0);
             controls.update();
+        }
+
+        // Add ground grid and axes once sized
+        if (!helpersAdded) {
+            const grid = new THREE.GridHelper(maxDim * 2, 40, 0x444444, 0x222222);
+            grid.position.y = 0;
+            scene.add(grid);
+            const axes = new THREE.AxesHelper(maxDim * 0.6);
+            scene.add(axes);
+            helpersAdded = true;
         }
 
         // Store original vertices (targets) for wobble/formation
@@ -120,8 +149,14 @@ function init() {
         formationDone = false;
 
         // Scale wobble and raycast threshold relative to model size
-        wobbleIntensity = Math.max(maxDim * 0.004, pointSize * 0.75);
-        hoverRadius = Math.max(maxDim * 0.06, pointSize * 6);
+        wobbleIntensity = Math.max(maxDim * 0.004, params.pointSize * 0.75);
+        hoverRadius = Math.max(maxDim * 0.06, params.pointSize * 6);
+
+        // Init walk speed option based on camera distance
+        params.walkSpeed = (camera.position.z * 0.6) / 8; // cross ~8s by default
+
+        // Build UI
+        setupGUI(merged);
 
     }, undefined, (error) => {
         console.error("Error loading tiger model:", error);
@@ -224,8 +259,10 @@ function animate() {
             // Initialize based on camera distance
             const z = camera.position.z;
             walkRange = z * 0.6; // stays in view
-            walkSpeed = walkRange / 8; // cross in ~8s
+            walkSpeed = params.walkSpeed || (walkRange / 8); // cross in ~8s
         }
+        // sync with UI-updated speed
+        walkSpeed = params.walkSpeed;
         tigerGroup.position.x += walkDirection * walkSpeed * dt;
         if (tigerGroup.position.x > walkRange) {
             walkDirection = -1;
@@ -241,6 +278,85 @@ function animate() {
     if (controls) controls.update();
 
     renderer.render(scene, camera);
+}
+
+// --- Helpers ---
+
+function samplePointsFromGeometry(geometry, count) {
+    const mesh = new THREE.Mesh(geometry);
+    const sampler = new MeshSurfaceSampler(mesh).build();
+    const positions = new Float32Array(count * 3);
+    const tempPosition = new THREE.Vector3();
+    for (let i = 0; i < count; i++) {
+        sampler.sample(tempPosition);
+        positions[i * 3] = tempPosition.x;
+        positions[i * 3 + 1] = tempPosition.y;
+        positions[i * 3 + 2] = tempPosition.z;
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.computeBoundingBox();
+    return geom;
+}
+
+function rebuildPointCloud(mergedGeometry) {
+    if (!tiger) return;
+    const newGeom = samplePointsFromGeometry(mergedGeometry, params.pointCount);
+    // Dispose old geometry to free memory
+    tiger.geometry.dispose();
+    tiger.geometry = newGeom;
+    // Update original + formation arrays
+    const posAttr = tiger.geometry.getAttribute('position');
+    originalVertices = Array.from(posAttr.array);
+    startVertices = new Float32Array(posAttr.array.length);
+    const maxDim = tiger.geometry.boundingBox ? tiger.geometry.boundingBox.getSize(new THREE.Vector3()).length() : 1;
+    const R = (maxDim || 1) * 10;
+    for (let i = 0; i < startVertices.length; i += 3) {
+        let x = Math.random() * 2 - 1;
+        let y = Math.random() * 2 - 1;
+        let z = Math.random() * 2 - 1;
+        const len = Math.hypot(x, y, z) || 1;
+        x /= len; y /= len; z /= len;
+        const r = R * (0.8 + Math.random() * 0.4);
+        startVertices[i] = x * r;
+        startVertices[i + 1] = y * r;
+        startVertices[i + 2] = z * r;
+        posAttr.array[i] = startVertices[i];
+        posAttr.array[i + 1] = startVertices[i + 1];
+        posAttr.array[i + 2] = startVertices[i + 2];
+    }
+    posAttr.needsUpdate = true;
+    formationStart = performance.now();
+    formationDone = false;
+}
+
+function setupGUI(mergedGeometry) {
+    const gui = new GUI();
+    gui.title('Tiger Controls');
+
+    gui.add(params, 'pointCount', 2000, 150000, 1000)
+        .name('Density (points)')
+        .onFinishChange(() => rebuildPointCloud(mergedGeometry));
+
+    gui.add(params, 'pointSize', 0.0005, 0.05, 0.0005)
+        .name('Point Size')
+        .onChange((v) => {
+            if (tiger) {
+                tiger.material.size = v;
+                // Update thresholds tied to size
+                hoverRadius = Math.max(hoverRadius, v * 6);
+            }
+        });
+
+    gui.addColor(params, 'color')
+        .name('Color')
+        .onChange((v) => {
+            if (tiger) tiger.material.color.set(v);
+        });
+
+    gui.add(params, 'walkSpeed', 0, 10, 0.1)
+        .name('Walk Speed')
+        .onChange((v) => { params.walkSpeed = v; });
 }
 
 function onDocumentMouseMove(event) {
