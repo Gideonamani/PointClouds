@@ -7,6 +7,8 @@ import GUI from 'three/addons/libs/lil-gui.module.min.js';
 
 let scene, camera, renderer, controls, tiger, tigerGroup;
 let originalVertices = [];
+let stripeCoord = null; // per-point scalar 0..1 along body length
+let colorArray = null;  // Float32Array for per-vertex colors
 let startVertices = null; // for formation animation
 let wobbleIntensity = 0.1; // scaled after load based on model size
 let hoverPointLocal = null;
@@ -21,6 +23,16 @@ let gridHelper = null;
 let axesHelper = null;
 let rotationAxisLine = null;
 let baseMergedGeometry = null; // before orientation/alignment
+let lastColorUpdate = 0;
+const targetColorFPS = 45; // throttle color recomputation if needed
+
+// Local axes + gizmo
+let tigerAxesHelper = null;
+let gizmoGroup = null;
+let gizmoRings = { x: null, y: null, z: null };
+let isDraggingGizmo = false;
+let activeAxis = null; // 'x' | 'y' | 'z' | null
+let dragStartInfo = null; // { axis: 'x', center: Vector3, axisWorld: Vector3, startVec: Vector3, startRot: {x,y,z} }
 
 // UI params
 const params = {
@@ -33,8 +45,30 @@ const params = {
     showGrid: true,
     explode: 0.0, // 0 formed .. 1 fully exploded
     showRotationAxis: true,
+    showLocalAxes: true,
+    showGizmo: true,
     modelUp: '+Y',
     modelForward: '+X',
+    // Stripes
+    stripesEnabled: true,
+    stripesCount: 8,
+    rippleSpeed: 0.6,     // cycles per second
+    rippleAmplitude: 0.4, // 0..1 offset of stripe phase
+    rippleWaves: 2,       // additional wave count across body
+    stripeSoftness: 0.25, // 0 hard bands .. 1 very soft
+    palette: 'Tiger',
+    // Orientation manipulator (degrees)
+    rotXDeg: 0,
+    rotYDeg: 0,
+    rotZDeg: 0,
+};
+
+// Predefined color palettes
+const palettes = {
+    Tiger: ['#111111', '#ff8800', '#111111', '#ff8800'],
+    Rainbow: ['#ff0000','#ffa500','#ffff00','#00ff00','#00bfff','#0000ff','#8a2be2'],
+    Warm: ['#4b1d0e','#7a2f16','#b3431e','#f36f21','#ffc857'],
+    Cool: ['#0b132b','#1c2541','#3a506b','#5bc0be','#cce2e1'],
 };
 
 const pose = { x: 0, y: 0, z: 0, yawDeg: 0 };
@@ -134,6 +168,8 @@ function init() {
         // Store original vertices (targets) for wobble/formation
         const posAttr = tiger.geometry.getAttribute('position');
         originalVertices = Array.from(posAttr.array);
+        // Initialize stripes data + color attribute
+        initStripesData();
 
         // Initialize formation: start far away, converge to original
         startVertices = new Float32Array(posAttr.array.length);
@@ -171,12 +207,26 @@ function init() {
         // Create rotation axis visualization
         createOrUpdateRotationAxisLine();
 
+        // Create local axes helper attached to tiger
+        if (!tigerAxesHelper) {
+            tigerAxesHelper = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.6);
+            tiger.add(tigerAxesHelper);
+        } else {
+            tigerAxesHelper.scale.setScalar(Math.max(size.x, size.y, size.z) * 0.6 / tigerAxesHelper.size || 1);
+        }
+        tigerAxesHelper.visible = params.showLocalAxes;
+
+        // Create rotation gizmo rings
+        createOrUpdateGizmo(Math.max(size.x, size.y, size.z));
+
     }, undefined, (error) => {
         console.error("Error loading tiger model:", error);
     });
 
     window.addEventListener('resize', onWindowResize, false);
     document.addEventListener('mousemove', onDocumentMouseMove, false);
+    document.addEventListener('mousedown', onDocumentMouseDown, false);
+    document.addEventListener('mouseup', onDocumentMouseUp, false);
 
     animate();
 }
@@ -269,6 +319,11 @@ function animate() {
         if (params.rotationSpeed) {
             tiger.rotation.y += params.rotationSpeed * dt;
         }
+
+        // Update per-vertex colors if stripes enabled
+        if (params.stripesEnabled) {
+            updateStripeColors();
+        }
     }
 
     // Walking animation for the whole group
@@ -338,6 +393,8 @@ function rebuildPointCloud(mergedGeometry) {
     // Update original + formation arrays
     const posAttr = tiger.geometry.getAttribute('position');
     originalVertices = Array.from(posAttr.array);
+    // Re-init stripes and colors for new geometry
+    initStripesData();
     startVertices = new Float32Array(posAttr.array.length);
     const maxDim = tiger.geometry.boundingBox ? tiger.geometry.boundingBox.getSize(new THREE.Vector3()).length() : 1;
     const R = (maxDim || 1) * 10;
@@ -361,6 +418,11 @@ function rebuildPointCloud(mergedGeometry) {
 
     // update rotation axis line for new size
     createOrUpdateRotationAxisLine();
+    // update gizmo for new size
+    const bbox = tiger.geometry.boundingBox;
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+    createOrUpdateGizmo(Math.max(size.x, size.y, size.z));
 }
 
 function setupGUI(mergedGeometry) {
@@ -384,7 +446,9 @@ function setupGUI(mergedGeometry) {
     gui.addColor(params, 'color')
         .name('Color')
         .onChange((v) => {
-            if (tiger) tiger.material.color.set(v);
+            if (tiger && !params.stripesEnabled) {
+                tiger.material.color.set(v);
+            }
         });
 
     gui.add(params, 'walkSpeed', 0, 10, 0.1)
@@ -397,7 +461,7 @@ function setupGUI(mergedGeometry) {
     gui.add(params, 'rotationSpeed', 0, 2, 0.01)
         .name('Rotation Speed');
 
-    gui.add(params, 'explode', 0, 1, 0.01)
+    gui.add(params, 'explode', 0, 0.1, 0.001)
         .name('Explode');
 
     gui.add(params, 'showGrid')
@@ -411,6 +475,50 @@ function setupGUI(mergedGeometry) {
         .name('Show Rotation Axis')
         .onChange((v) => { if (rotationAxisLine) rotationAxisLine.visible = v; });
 
+    gui.add(params, 'showLocalAxes')
+        .name('Show Local Axes')
+        .onChange((v) => { if (tigerAxesHelper) tigerAxesHelper.visible = v; });
+
+    gui.add(params, 'showGizmo')
+        .name('Show Rotation Gizmo')
+        .onChange((v) => { if (gizmoGroup) gizmoGroup.visible = v; });
+
+    const stripes = gui.addFolder('Stripes');
+    stripes.add(params, 'stripesEnabled')
+        .name('Enable Stripes')
+        .onChange((v) => {
+            if (!tiger) return;
+            tiger.material.vertexColors = v;
+            tiger.material.needsUpdate = true;
+            // When disabling, restore solid color
+            if (!v) {
+                if (tiger.geometry.getAttribute('color')) {
+                    tiger.geometry.deleteAttribute('color');
+                }
+                tiger.material.color.set(params.color);
+            } else {
+                // ensure color attribute exists and refresh colors
+                ensureColorAttribute();
+                updateStripeColors(true);
+            }
+        });
+    stripes.add(params, 'palette', Object.keys(palettes))
+        .name('Palette')
+        .onChange(() => updateStripeColors(true));
+    stripes.add(params, 'stripesCount', 2, 32, 1)
+        .name('Stripe Count')
+        .onChange(() => updateStripeColors(true));
+    stripes.add(params, 'stripeSoftness', 0, 1, 0.01)
+        .name('Softness')
+        .onChange(() => updateStripeColors(true));
+    stripes.add(params, 'rippleWaves', 0, 10, 1)
+        .name('Ripple Waves')
+        .onChange(() => updateStripeColors(true));
+    stripes.add(params, 'rippleAmplitude', 0, 1, 0.01)
+        .name('Ripple Amplitude');
+    stripes.add(params, 'rippleSpeed', 0, 3, 0.01)
+        .name('Ripple Speed');
+
     const orientFolder = gui.addFolder('Orientation');
     orientFolder.add(params, 'modelUp', ['+X','-X','+Y','-Y','+Z','-Z'])
         .name('Model Up')
@@ -418,6 +526,16 @@ function setupGUI(mergedGeometry) {
     orientFolder.add(params, 'modelForward', ['+X','-X','+Y','-Y','+Z','-Z'])
         .name('Model Forward')
         .onFinishChange(() => rebuildPointCloud(mergedGeometry));
+
+    const manipFolder = gui.addFolder('Orientation Manipulator');
+    manipFolder.add(params, 'rotXDeg', -180, 180, 1).name('Rotate X (deg)')
+        .onChange(applyOrientationFromParams).listen();
+    manipFolder.add(params, 'rotYDeg', -180, 180, 1).name('Rotate Y (deg)')
+        .onChange(applyOrientationFromParams).listen();
+    manipFolder.add(params, 'rotZDeg', -180, 180, 1).name('Rotate Z (deg)')
+        .onChange(applyOrientationFromParams).listen();
+    manipFolder.add({ reset: () => { params.rotXDeg = 0; params.rotYDeg = 0; params.rotZDeg = 0; applyOrientationFromParams(); }}, 'reset')
+        .name('Reset Orientation');
 
     const poseFolder = gui.addFolder('Pose (read-only)');
     poseFolder.add(pose, 'x').name('X').listen();
@@ -504,6 +622,245 @@ function createOrUpdateRotationAxisLine() {
     rotationAxisLine.visible = params.showRotationAxis;
 }
 
+function createOrUpdateGizmo(maxDim) {
+    if (!tiger) return;
+    const L = Math.max(0.001, maxDim * 0.6);
+    const ringR = L * 0.18;
+    const tubeR = L * 0.01;
+
+    if (!gizmoGroup) {
+        gizmoGroup = new THREE.Group();
+        tiger.add(gizmoGroup);
+    }
+    // Clear previous children
+    while (gizmoGroup.children.length) {
+        const c = gizmoGroup.children.pop();
+        c.geometry && c.geometry.dispose && c.geometry.dispose();
+        c.material && c.material.dispose && c.material.dispose();
+    }
+
+    // Helper to build a ring oriented along axis and positioned at axis end
+    const makeRing = (axis) => {
+        const geo = new THREE.TorusGeometry(ringR, tubeR, 24, 64);
+        const color = axis === 'x' ? 0xff4444 : axis === 'y' ? 0x44ff44 : 0x4488ff;
+        const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false });
+        const mesh = new THREE.Mesh(geo, mat);
+        // Orient torus axis to align with requested axis
+        if (axis === 'x') mesh.rotation.z = Math.PI / 2;
+        if (axis === 'z') mesh.rotation.x = Math.PI / 2;
+        // Place at end of axis
+        if (axis === 'x') mesh.position.set(L, 0, 0);
+        if (axis === 'y') mesh.position.set(0, L, 0);
+        if (axis === 'z') mesh.position.set(0, 0, L);
+        mesh.renderOrder = 999;
+        mesh.userData.gizmoAxis = axis;
+        return mesh;
+    };
+
+    gizmoRings.x = makeRing('x');
+    gizmoRings.y = makeRing('y');
+    gizmoRings.z = makeRing('z');
+    gizmoGroup.add(gizmoRings.x, gizmoRings.y, gizmoRings.z);
+    gizmoGroup.visible = params.showGizmo;
+
+    // Add positive axis arrows for clarity
+    const addArrow = (dir, color) => {
+        const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), L, color, L * 0.12, L * 0.06);
+        gizmoGroup.add(arrow);
+    };
+    addArrow(new THREE.Vector3(1, 0, 0), 0xff4444);
+    addArrow(new THREE.Vector3(0, 1, 0), 0x44ff44);
+    addArrow(new THREE.Vector3(0, 0, 1), 0x4488ff);
+}
+
+function applyOrientationFromParams() {
+    if (!tiger) return;
+    tiger.rotation.x = THREE.MathUtils.degToRad(params.rotXDeg);
+    tiger.rotation.y = THREE.MathUtils.degToRad(params.rotYDeg);
+    tiger.rotation.z = THREE.MathUtils.degToRad(params.rotZDeg);
+}
+
+function onDocumentMouseDown(event) {
+    if (!tiger || !gizmoGroup || !params.showGizmo) return;
+    const mouse = new THREE.Vector2(
+        (event.clientX / window.innerWidth) * 2 - 1,
+        -(event.clientY / window.innerHeight) * 2 + 1
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, camera);
+    const pickables = [gizmoRings.x, gizmoRings.y, gizmoRings.z].filter(Boolean);
+    const hits = raycaster.intersectObjects(pickables, true);
+    if (hits.length > 0) {
+        const hit = hits[0];
+        const axis = hit.object.userData.gizmoAxis;
+        if (!axis) return;
+        // Setup drag
+        isDraggingGizmo = true;
+        activeAxis = axis;
+        if (controls) controls.enabled = false;
+
+        // Compute ring center in world
+        const L = hit.object.position.clone().applyMatrix4(hit.object.matrixWorld.clone().multiply(new THREE.Matrix4().makeTranslation(0,0,0)));
+        const center = hit.object.getWorldPosition(new THREE.Vector3());
+
+        // Axis in world
+        const axisWorld = new THREE.Vector3(
+            axis === 'x' ? 1 : 0,
+            axis === 'y' ? 1 : 0,
+            axis === 'z' ? 1 : 0
+        ).applyQuaternion(tiger.getWorldQuaternion(new THREE.Quaternion()));
+        axisWorld.normalize();
+
+        // Initial vector from ring center to hit point, projected onto plane
+        const hitPoint = hit.point.clone();
+        const v0 = hitPoint.clone().sub(center);
+        const vStart = v0.clone().sub(axisWorld.clone().multiplyScalar(v0.dot(axisWorld))).normalize();
+
+        dragStartInfo = {
+            axis,
+            center,
+            axisWorld,
+            startVec: vStart,
+            startRot: { x: tiger.rotation.x, y: tiger.rotation.y, z: tiger.rotation.z },
+        };
+        event.preventDefault();
+    }
+}
+
+function onDocumentMouseUp() {
+    if (isDraggingGizmo) {
+        isDraggingGizmo = false;
+        activeAxis = null;
+        dragStartInfo = null;
+        if (controls) controls.enabled = true;
+        // Sync GUI with current rotation
+        params.rotXDeg = THREE.MathUtils.radToDeg(tiger.rotation.x);
+        params.rotYDeg = THREE.MathUtils.radToDeg(tiger.rotation.y);
+        params.rotZDeg = THREE.MathUtils.radToDeg(tiger.rotation.z);
+    }
+}
+
+function updateGizmoDrag(raycaster) {
+    if (!dragStartInfo || !activeAxis) return;
+    // Build plane for the active ring (perpendicular to axis, passing through center)
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(dragStartInfo.axisWorld, dragStartInfo.center);
+    const ray = raycaster.ray;
+    const hitPoint = new THREE.Vector3();
+    if (!ray.intersectPlane(plane, hitPoint)) return;
+
+    // Current vector on the plane from center to hit
+    const v = hitPoint.clone().sub(dragStartInfo.center);
+    const vProj = v.clone().sub(dragStartInfo.axisWorld.clone().multiplyScalar(v.dot(dragStartInfo.axisWorld)));
+    if (vProj.lengthSq() < 1e-8) return;
+    const vCur = vProj.normalize();
+
+    // Signed angle around axisWorld
+    const cross = new THREE.Vector3().crossVectors(dragStartInfo.startVec, vCur);
+    const sin = dragStartInfo.axisWorld.dot(cross);
+    const cos = dragStartInfo.startVec.dot(vCur);
+    const delta = Math.atan2(sin, cos);
+
+    // Apply rotation around the active axis in local space by delta (relative to drag start)
+    if (activeAxis === 'x') tiger.rotation.x = dragStartInfo.startRot.x + delta;
+    if (activeAxis === 'y') tiger.rotation.y = dragStartInfo.startRot.y + delta;
+    if (activeAxis === 'z') tiger.rotation.z = dragStartInfo.startRot.z + delta;
+}
+// --- Stripes / Ripple Coloring ---
+
+function initStripesData() {
+    if (!tiger) return;
+    const geom = tiger.geometry;
+    const pos = geom.getAttribute('position');
+    const count = pos.count;
+    // Build normalized stripe coordinate along X after orientation
+    geom.computeBoundingBox();
+    const minX = geom.boundingBox.min.x;
+    const maxX = geom.boundingBox.max.x;
+    const span = Math.max(1e-6, maxX - minX);
+    stripeCoord = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+        const x = pos.getX(i);
+        stripeCoord[i] = (x - minX) / span; // 0..1
+    }
+    // Ensure color attribute exists if stripes enabled
+    if (params.stripesEnabled) {
+        ensureColorAttribute();
+        updateStripeColors(true);
+        tiger.material.vertexColors = true;
+        tiger.material.needsUpdate = true;
+    }
+}
+
+function ensureColorAttribute() {
+    if (!tiger) return;
+    const geom = tiger.geometry;
+    const count = geom.getAttribute('position').count;
+    let attr = geom.getAttribute('color');
+    if (!attr || attr.count !== count) {
+        colorArray = new Float32Array(count * 3);
+        geom.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+    } else {
+        colorArray = attr.array;
+    }
+}
+
+function getActivePalette() {
+    const list = palettes[params.palette] || palettes.Tiger;
+    // Convert to THREE.Color instances once per call
+    return list.map((hex) => new THREE.Color(hex));
+}
+
+function lerpColor(c1, c2, t) {
+    // simple linear interpolation in RGB space
+    return new THREE.Color(
+        c1.r + (c2.r - c1.r) * t,
+        c1.g + (c2.g - c1.g) * t,
+        c1.b + (c2.b - c1.b) * t,
+    );
+}
+
+function updateStripeColors(force = false) {
+    if (!tiger || !params.stripesEnabled) return;
+    ensureColorAttribute();
+    const now = performance.now();
+    if (!force) {
+        const minDelta = 1000 / targetColorFPS;
+        if (now - lastColorUpdate < minDelta) return;
+    }
+    lastColorUpdate = now;
+
+    const geom = tiger.geometry;
+    const count = geom.getAttribute('position').count;
+    const attr = geom.getAttribute('color');
+    const arr = attr.array;
+    const palette = getActivePalette();
+    const P = palette.length;
+
+    const t = now * 0.001; // seconds
+    const stripes = Math.max(1, Math.floor(params.stripesCount));
+    const waves = Math.max(0, Math.floor(params.rippleWaves));
+    const amp = Math.max(0, Math.min(1, params.rippleAmplitude));
+    const speed = Math.max(0, params.rippleSpeed);
+    // Map softness 0..1 to gamma 8..0.5 (lower gamma = softer blend)
+    const gamma = THREE.MathUtils.lerp(8, 0.5, Math.max(0, Math.min(1, params.stripeSoftness)));
+
+    for (let i = 0; i < count; i++) {
+        const s = stripeCoord ? stripeCoord[i] : 0; // 0..1
+        const phase = s * stripes + amp * Math.sin(2 * Math.PI * (s * waves - t * speed));
+        const base = Math.floor(phase);
+        const frac = phase - base; // 0..1
+        let mix = Math.pow(frac, gamma);
+        const i1 = ((base % P) + P) % P;
+        const i2 = ((i1 + 1) % P);
+        const c = lerpColor(palette[i1], palette[i2], mix);
+        const j = i * 3;
+        arr[j] = c.r;
+        arr[j + 1] = c.g;
+        arr[j + 2] = c.b;
+    }
+    attr.needsUpdate = true;
+}
+
 function onDocumentMouseMove(event) {
     event.preventDefault();
 
@@ -515,6 +872,12 @@ function onDocumentMouseMove(event) {
 
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(mouse, camera);
+
+    // Handle gizmo dragging first
+    if (isDraggingGizmo && activeAxis && dragStartInfo) {
+        updateGizmoDrag(raycaster);
+        return; // skip wobble during drag
+    }
     // Use world-space hover radius for hit testing to match wobble area
     raycaster.params.Points.threshold = Math.max(hoverRadius, 0.01);
 
