@@ -33,6 +33,12 @@ let gizmoRings = { x: null, y: null, z: null };
 let isDraggingGizmo = false;
 let activeAxis = null; // 'x' | 'y' | 'z' | null
 let dragStartInfo = null; // { axis: 'x', center: Vector3, axisWorld: Vector3, startVec: Vector3, startRot: {x,y,z} }
+// Base orientation (from params) used every frame, gait adds on top
+let baseRot = { x: 0, y: 0, z: 0 }; // radians
+// Materials/textures for GPU stripes
+let cpuPointsMaterial = null;
+let gpuStripesMaterial = null;
+let paletteTexture = null;
 
 // UI params
 const params = {
@@ -47,10 +53,12 @@ const params = {
     showRotationAxis: true,
     showLocalAxes: true,
     showGizmo: true,
+    floorHeight: -0.97,
     modelUp: '+Y',
     modelForward: '+X',
     // Stripes
     stripesEnabled: true,
+    stripesGPU: false,
     stripesCount: 8,
     rippleSpeed: 0.6,     // cycles per second
     rippleAmplitude: 0.4, // 0..1 offset of stripe phase
@@ -58,9 +66,19 @@ const params = {
     stripeSoftness: 0.25, // 0 hard bands .. 1 very soft
     palette: 'Tiger',
     // Orientation manipulator (degrees)
-    rotXDeg: 0,
-    rotYDeg: 0,
-    rotZDeg: 0,
+    rotXDeg: 105,
+    rotYDeg: -90,
+    rotZDeg: -30,
+    // Wobble boost
+    wobbleIntensityMult: 2.0,
+    wobbleRadiusMult: 1.2,
+    wobbleNoiseSpeed: 1.6,
+    // Simple gait
+    gaitEnabled: true,
+    gaitBobAmp: 0.03,
+    gaitSwayAmp: 0.02,
+    gaitPitchAmpDeg: 2.0,
+    gaitFreq: 1.2,
 };
 
 // Predefined color palettes
@@ -127,7 +145,7 @@ function init() {
         params.pointSize = pointSize;
         params.pointCount = Math.min(60000, Math.max(8000, Math.floor((size.x * size.y + size.z * size.x + size.y * size.z) * 120)));
 
-        const material = new THREE.PointsMaterial({
+        cpuPointsMaterial = new THREE.PointsMaterial({
             color: new THREE.Color(params.color),
             size: params.pointSize,
             sizeAttenuation: true
@@ -135,7 +153,7 @@ function init() {
 
         // Build initial sampled point cloud for adjustable density
         const sampled = samplePointsFromGeometry(oriented, params.pointCount);
-        tiger = new THREE.Points(sampled, material);
+        tiger = new THREE.Points(sampled, cpuPointsMaterial);
         tigerGroup = new THREE.Group();
         tigerGroup.add(tiger);
         scene.add(tigerGroup);
@@ -156,7 +174,7 @@ function init() {
         // Add ground grid and axes once sized
         if (!helpersAdded) {
             gridHelper = new THREE.GridHelper(maxDim * 2, 40, 0x444444, 0x222222);
-            gridHelper.position.y = 0;
+            gridHelper.position.y = params.floorHeight || 0;
             scene.add(gridHelper);
             axesHelper = new THREE.AxesHelper(maxDim * 0.6);
             scene.add(axesHelper);
@@ -195,8 +213,8 @@ function init() {
         formationDone = false;
 
         // Scale wobble and raycast threshold relative to model size
-        wobbleIntensity = Math.max(maxDim * 0.004, params.pointSize * 0.75);
-        hoverRadius = Math.max(maxDim * 0.06, params.pointSize * 6);
+        wobbleIntensity = Math.max(maxDim * 0.004, params.pointSize * 0.75) * params.wobbleIntensityMult;
+        hoverRadius = Math.max(maxDim * 0.06, params.pointSize * 6) * params.wobbleRadiusMult;
 
         // Init walk speed option based on camera distance
         params.walkSpeed = (camera.position.z * 0.6) / 8; // cross ~8s by default
@@ -220,6 +238,10 @@ function init() {
         // Create rotation gizmo rings
         createOrUpdateGizmo(Math.max(size.x, size.y, size.z));
 
+        // Apply initial orientation from params and floor height
+        applyOrientationFromParams();
+        if (gridHelper) gridHelper.position.y = params.floorHeight;
+
     }, undefined, (error) => {
         console.error("Error loading tiger model:", error);
     });
@@ -242,11 +264,13 @@ function onWindowResize() {
 let walkDirection = 1;
 let walkRange = 0; // set after load via cameraZ or model size
 let walkSpeed = 0; // units per second
+let walkStarted = false; // start after formation
 
 function animate() {
     requestAnimationFrame(animate);
 
     const dt = clock.getDelta();
+    const elapsed = clock.elapsedTime;
 
     if (tiger) {
         // Formation + explode control combined as an "effective explode factor"
@@ -286,9 +310,19 @@ function animate() {
                     const d = Math.sqrt(Math.max(d2, 1e-6));
                     const falloff = 1 - d / hoverRadius; // 0..1
                     const amp = wobbleIntensity * falloff * falloff;
-                    arr[i] = bx + (Math.random() - 0.5) * amp;
-                    arr[i + 1] = by + (Math.random() - 0.5) * amp;
-                    arr[i + 2] = bz + (Math.random() - 0.5) * amp;
+                    // Coherent wobble using position-based hash and time
+                    const seed = ox * 12.9898 + oy * 78.233 + oz * 37.719;
+                    const tphase = performance.now() * 0.001 * params.wobbleNoiseSpeed * Math.PI * 2.0;
+                    const n = Math.sin(seed + tphase); // -1..1
+                    // Stable pseudo-random direction from seed
+                    let vx = Math.sin(seed * 1.3);
+                    let vy = Math.sin(seed * 1.7 + 1.0);
+                    let vz = Math.sin(seed * 1.9 + 2.0);
+                    const vlen = Math.hypot(vx, vy, vz) || 1;
+                    vx /= vlen; vy /= vlen; vz /= vlen;
+                    arr[i] = bx + vx * amp * n;
+                    arr[i + 1] = by + vy * amp * n;
+                    arr[i + 2] = bz + vz * amp * n;
                 } else {
                     // Relax toward base
                     arr[i] += (bx - arr[i]) * Math.min(1, dt * 10);
@@ -316,14 +350,21 @@ function animate() {
         }
         if (updated) posAttr.needsUpdate = true;
 
-        // Optional independent rotation animation (about local Y)
-        if (params.rotationSpeed) {
-            tiger.rotation.y += params.rotationSpeed * dt;
+        // Compose orientation: base params + gait
+        const baseX = baseRot.x;
+        const baseY = baseRot.y;
+        const baseZ = baseRot.z;
+        let addPitch = 0;
+        if (params.gaitEnabled) {
+            const phase = elapsed * params.gaitFreq * Math.PI * 2;
+            addPitch = THREE.MathUtils.degToRad(Math.sin(phase) * params.gaitPitchAmpDeg);
         }
+        tiger.rotation.set(baseX + addPitch, baseY, baseZ);
 
-        // Update per-vertex colors if stripes enabled
-        if (params.stripesEnabled) {
-            updateStripeColors();
+        // Update stripes coloring
+        if (params.stripesEnabled && !params.stripesGPU) updateStripeColors();
+        if (params.stripesEnabled && params.stripesGPU && tiger.material && tiger.material.uniforms) {
+            tiger.material.uniforms.uTime.value = elapsed;
         }
     }
 
@@ -337,7 +378,15 @@ function animate() {
         }
         // sync with UI-updated speed
         walkSpeed = params.walkSpeed;
-        if (!params.pauseWalk) {
+        // After formation, set initial start position once
+        if (!walkStarted && formationDone) {
+            tigerGroup.position.x = -walkRange;
+            walkDirection = 1;
+            tigerGroup.rotation.y = 0;
+            walkStarted = true;
+        }
+        // Start walking only after formation completes
+        if (!params.pauseWalk && formationDone) {
             tigerGroup.position.x += walkDirection * walkSpeed * dt;
         }
         if (tigerGroup.position.x > walkRange) {
@@ -348,6 +397,12 @@ function animate() {
             walkDirection = 1;
             tigerGroup.position.x = -walkRange;
             tigerGroup.rotation.y = 0;
+        }
+        // Procedural gait translation components (bob/sway)
+        if (params.gaitEnabled) {
+            const phase = elapsed * params.gaitFreq * Math.PI * 2;
+            tiger.position.y = Math.sin(phase) * params.gaitBobAmp;
+            tiger.position.z = Math.sin(phase * 0.5 + Math.PI * 0.25) * params.gaitSwayAmp;
         }
     }
 
@@ -424,6 +479,12 @@ function rebuildPointCloud(mergedGeometry) {
     const size = new THREE.Vector3();
     bbox.getSize(size);
     createOrUpdateGizmo(Math.max(size.x, size.y, size.z));
+    // update floor slider dynamic range if needed
+    // keep current value but clamp GUI min/max via helper folder would require recreation; omitted
+    // if using GPU stripes, reapply shader material and palette
+    if (params.stripesEnabled && params.stripesGPU) {
+        switchStripesMaterial(true);
+    }
 }
 
 function setupGUI(mergedGeometry) {
@@ -438,7 +499,8 @@ function setupGUI(mergedGeometry) {
         .name('Point Size')
         .onChange((v) => {
             if (tiger) {
-                tiger.material.size = v;
+                if ('size' in tiger.material) tiger.material.size = v;
+                if (tiger.material.uniforms && tiger.material.uniforms.uSize) tiger.material.uniforms.uSize.value = v;
                 // Update thresholds tied to size
                 hoverRadius = Math.max(hoverRadius, v * 6);
             }
@@ -484,12 +546,18 @@ function setupGUI(mergedGeometry) {
         .name('Show Rotation Gizmo')
         .onChange((v) => { if (gizmoGroup) gizmoGroup.visible = v; });
 
+    const floorFolder = gui.addFolder('Floor');
+    floorFolder.add(params, 'floorHeight', -5, 5, 0.01)
+        .name('Floor Height (Y)')
+        .onChange((v) => { if (gridHelper) gridHelper.position.y = v; });
+    floorFolder.add({ snap: () => snapFloorToTiger() }, 'snap').name('Snap To Tiger');
+
     const stripes = gui.addFolder('Stripes');
     stripes.add(params, 'stripesEnabled')
         .name('Enable Stripes')
         .onChange((v) => {
             if (!tiger) return;
-            tiger.material.vertexColors = v;
+            tiger.material.vertexColors = v && !params.stripesGPU;
             tiger.material.needsUpdate = true;
             // When disabling, restore solid color
             if (!v) {
@@ -503,22 +571,39 @@ function setupGUI(mergedGeometry) {
                 updateStripeColors(true);
             }
         });
+    stripes.add(params, 'stripesGPU')
+        .name('Use GPU Shader')
+        .onChange((useGPU) => switchStripesMaterial(useGPU));
     stripes.add(params, 'palette', Object.keys(palettes))
         .name('Palette')
-        .onChange(() => updateStripeColors(true));
+        .onChange(() => {
+            if (params.stripesGPU) buildPaletteTexture();
+            else updateStripeColors(true);
+        });
     stripes.add(params, 'stripesCount', 2, 32, 1)
         .name('Stripe Count')
-        .onChange(() => updateStripeColors(true));
+        .onChange(() => {
+            if (params.stripesGPU && gpuStripesMaterial) gpuStripesMaterial.uniforms.uStripes.value = params.stripesCount;
+            else updateStripeColors(true);
+        });
     stripes.add(params, 'stripeSoftness', 0, 1, 0.01)
         .name('Softness')
-        .onChange(() => updateStripeColors(true));
+        .onChange(() => {
+            if (params.stripesGPU && gpuStripesMaterial) gpuStripesMaterial.uniforms.uSoftness.value = params.stripeSoftness;
+            else updateStripeColors(true);
+        });
     stripes.add(params, 'rippleWaves', 0, 10, 1)
         .name('Ripple Waves')
-        .onChange(() => updateStripeColors(true));
+        .onChange(() => {
+            if (params.stripesGPU && gpuStripesMaterial) gpuStripesMaterial.uniforms.uWaves.value = params.rippleWaves;
+            else updateStripeColors(true);
+        });
     stripes.add(params, 'rippleAmplitude', 0, 1, 0.01)
-        .name('Ripple Amplitude');
+        .name('Ripple Amplitude')
+        .onChange(() => { if (params.stripesGPU && gpuStripesMaterial) gpuStripesMaterial.uniforms.uAmp.value = params.rippleAmplitude; });
     stripes.add(params, 'rippleSpeed', 0, 3, 0.01)
-        .name('Ripple Speed');
+        .name('Ripple Speed')
+        .onChange(() => { if (params.stripesGPU && gpuStripesMaterial) gpuStripesMaterial.uniforms.uSpeed.value = params.rippleSpeed; });
 
     const orientFolder = gui.addFolder('Orientation');
     orientFolder.add(params, 'modelUp', ['+X','-X','+Y','-Y','+Z','-Z'])
@@ -537,6 +622,18 @@ function setupGUI(mergedGeometry) {
         .onChange(applyOrientationFromParams).listen();
     manipFolder.add({ reset: () => { params.rotXDeg = 0; params.rotYDeg = 0; params.rotZDeg = 0; applyOrientationFromParams(); }}, 'reset')
         .name('Reset Orientation');
+
+    const wobbleFolder = gui.addFolder('Wobble');
+    wobbleFolder.add(params, 'wobbleIntensityMult', 0.2, 5, 0.1).name('Intensity x');
+    wobbleFolder.add(params, 'wobbleRadiusMult', 0.5, 3, 0.1).name('Radius x');
+    wobbleFolder.add(params, 'wobbleNoiseSpeed', 0, 4, 0.1).name('Noise Speed');
+
+    const gaitFolder = gui.addFolder('Gait');
+    gaitFolder.add(params, 'gaitEnabled').name('Enable Gait');
+    gaitFolder.add(params, 'gaitBobAmp', 0, 0.2, 0.005).name('Bob Amp');
+    gaitFolder.add(params, 'gaitSwayAmp', 0, 0.2, 0.005).name('Sway Amp');
+    gaitFolder.add(params, 'gaitPitchAmpDeg', 0, 10, 0.1).name('Pitch Amp (deg)');
+    gaitFolder.add(params, 'gaitFreq', 0, 3, 0.05).name('Gait Freq');
 
     const poseFolder = gui.addFolder('Pose (read-only)');
     poseFolder.add(pose, 'x').name('X').listen();
@@ -675,10 +772,18 @@ function createOrUpdateGizmo(maxDim) {
 }
 
 function applyOrientationFromParams() {
-    if (!tiger) return;
-    tiger.rotation.x = THREE.MathUtils.degToRad(params.rotXDeg);
-    tiger.rotation.y = THREE.MathUtils.degToRad(params.rotYDeg);
-    tiger.rotation.z = THREE.MathUtils.degToRad(params.rotZDeg);
+    // Store base rotation (radians); animate() composes with gait each frame
+    baseRot.x = THREE.MathUtils.degToRad(params.rotXDeg);
+    baseRot.y = THREE.MathUtils.degToRad(params.rotYDeg);
+    baseRot.z = THREE.MathUtils.degToRad(params.rotZDeg);
+}
+
+function snapFloorToTiger() {
+    if (!gridHelper || !tiger) return;
+    const box = new THREE.Box3().setFromObject(tiger);
+    const minY = box.min.y;
+    gridHelper.position.y = minY;
+    params.floorHeight = minY;
 }
 
 function onDocumentMouseDown(event) {
@@ -722,6 +827,11 @@ function onDocumentMouseDown(event) {
             axisWorld,
             startVec: vStart,
             startRot: { x: tiger.rotation.x, y: tiger.rotation.y, z: tiger.rotation.z },
+            startParams: {
+                x: THREE.MathUtils.degToRad(params.rotXDeg),
+                y: THREE.MathUtils.degToRad(params.rotYDeg),
+                z: THREE.MathUtils.degToRad(params.rotZDeg),
+            },
         };
         event.preventDefault();
     }
@@ -733,10 +843,8 @@ function onDocumentMouseUp() {
         activeAxis = null;
         dragStartInfo = null;
         if (controls) controls.enabled = true;
-        // Sync GUI with current rotation
-        params.rotXDeg = THREE.MathUtils.radToDeg(tiger.rotation.x);
-        params.rotYDeg = THREE.MathUtils.radToDeg(tiger.rotation.y);
-        params.rotZDeg = THREE.MathUtils.radToDeg(tiger.rotation.z);
+        // GUI already reflects params updated during drag
+        applyOrientationFromParams();
     }
 }
 
@@ -760,10 +868,11 @@ function updateGizmoDrag(raycaster) {
     const cos = dragStartInfo.startVec.dot(vCur);
     const delta = Math.atan2(sin, cos);
 
-    // Apply rotation around the active axis in local space by delta (relative to drag start)
-    if (activeAxis === 'x') tiger.rotation.x = dragStartInfo.startRot.x + delta;
-    if (activeAxis === 'y') tiger.rotation.y = dragStartInfo.startRot.y + delta;
-    if (activeAxis === 'z') tiger.rotation.z = dragStartInfo.startRot.z + delta;
+    // Update base orientation params instead of directly rotating mesh
+    if (activeAxis === 'x') params.rotXDeg = THREE.MathUtils.radToDeg(dragStartInfo.startParams.x + delta);
+    if (activeAxis === 'y') params.rotYDeg = THREE.MathUtils.radToDeg(dragStartInfo.startParams.y + delta);
+    if (activeAxis === 'z') params.rotZDeg = THREE.MathUtils.radToDeg(dragStartInfo.startParams.z + delta);
+    applyOrientationFromParams();
 }
 // --- Stripes / Ripple Coloring ---
 
@@ -782,12 +891,18 @@ function initStripesData() {
         const x = pos.getX(i);
         stripeCoord[i] = (x - minX) / span; // 0..1
     }
+    // Attach stripe coordinate as attribute for shaders
+    geom.setAttribute('aStripe', new THREE.BufferAttribute(stripeCoord, 1));
     // Ensure color attribute exists if stripes enabled
     if (params.stripesEnabled) {
         ensureColorAttribute();
-        updateStripeColors(true);
-        tiger.material.vertexColors = true;
-        tiger.material.needsUpdate = true;
+        if (!params.stripesGPU) {
+            updateStripeColors(true);
+            tiger.material.vertexColors = true;
+            tiger.material.needsUpdate = true;
+        } else {
+            switchStripesMaterial(true);
+        }
     }
 }
 
@@ -859,6 +974,108 @@ function updateStripeColors(force = false) {
         arr[j + 2] = c.b;
     }
     attr.needsUpdate = true;
+}
+
+function buildPaletteTexture() {
+    const list = palettes[params.palette] || palettes.Tiger;
+    const w = 256, h = 1;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, w, 0);
+    for (let i = 0; i < list.length; i++) {
+        const t = i / (list.length - 1);
+        grad.addColorStop(t, list[i]);
+    }
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    paletteTexture = tex;
+    if (gpuStripesMaterial) gpuStripesMaterial.uniforms.uPalette.value = paletteTexture;
+}
+
+function buildGPUStripesMaterial() {
+    if (!paletteTexture) buildPaletteTexture();
+    const uniforms = {
+        uTime: { value: 0 },
+        uStripes: { value: params.stripesCount },
+        uWaves: { value: params.rippleWaves },
+        uAmp: { value: params.rippleAmplitude },
+        uSpeed: { value: params.rippleSpeed },
+        uSoftness: { value: params.stripeSoftness },
+        uSize: { value: params.pointSize },
+        uPalette: { value: paletteTexture },
+    };
+
+    const vertexShader = `
+        attribute float aStripe;
+        uniform float uSize;
+        varying float vStripe;
+        varying vec3 vWorldPos;
+        void main() {
+            vStripe = aStripe;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = uSize * (300.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+            vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;
+        }
+    `;
+    const fragmentShader = `
+        precision mediump float;
+        varying float vStripe;
+        uniform float uTime, uStripes, uWaves, uAmp, uSpeed, uSoftness;
+        uniform sampler2D uPalette;
+        void main() {
+            float phase = vStripe * uStripes + uAmp * sin(6.2831853 * (vStripe * uWaves - uTime * uSpeed));
+            float frac = phase - floor(phase);
+            float gamma = mix(8.0, 0.5, clamp(uSoftness, 0.0, 1.0));
+            float t = pow(frac, gamma);
+            vec3 col = texture2D(uPalette, vec2(t, 0.5)).rgb;
+            // round point
+            vec2 c = gl_PointCoord * 2.0 - 1.0;
+            float m = 1.0 - dot(c, c);
+            if (m <= 0.0) discard;
+            gl_FragColor = vec4(col, 1.0);
+        }
+    `;
+    const mat = new THREE.ShaderMaterial({
+        uniforms,
+        vertexShader,
+        fragmentShader,
+        transparent: false,
+        depthTest: true,
+    });
+    mat.extensions = { derivatives: false }; // keep simple
+    return mat;
+}
+
+function switchStripesMaterial(useGPU) {
+    if (!tiger) return;
+    if (useGPU) {
+        if (!gpuStripesMaterial) gpuStripesMaterial = buildGPUStripesMaterial();
+        tiger.material = gpuStripesMaterial;
+        if (tiger.material.uniforms && tiger.material.uniforms.uSize) {
+            tiger.material.uniforms.uSize.value = params.pointSize;
+        }
+        tiger.material.needsUpdate = true;
+        // GPU uses color in shader; ensure attribute exists
+        if (!tiger.geometry.getAttribute('aStripe') && stripeCoord) {
+            tiger.geometry.setAttribute('aStripe', new THREE.BufferAttribute(stripeCoord, 1));
+        }
+    } else {
+        // Back to CPU PointsMaterial
+        if (!cpuPointsMaterial) {
+            cpuPointsMaterial = new THREE.PointsMaterial({ color: params.color, size: params.pointSize, sizeAttenuation: true });
+        }
+        tiger.material = cpuPointsMaterial;
+        tiger.material.vertexColors = params.stripesEnabled;
+        tiger.material.needsUpdate = true;
+        updateStripeColors(true);
+    }
 }
 
 function onDocumentMouseMove(event) {
