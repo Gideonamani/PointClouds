@@ -208,12 +208,13 @@ function init() {
         createOrUpdateRotationAxisLine();
 
         // Create local axes helper attached to tiger
-        if (!tigerAxesHelper) {
-            tigerAxesHelper = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.6);
-            tiger.add(tigerAxesHelper);
-        } else {
-            tigerAxesHelper.scale.setScalar(Math.max(size.x, size.y, size.z) * 0.6 / tigerAxesHelper.size || 1);
+        if (tigerAxesHelper) {
+            tiger.remove(tigerAxesHelper);
+            tigerAxesHelper.geometry && tigerAxesHelper.geometry.dispose && tigerAxesHelper.geometry.dispose();
+            tigerAxesHelper.material && tigerAxesHelper.material.dispose && tigerAxesHelper.material.dispose();
         }
+        tigerAxesHelper = new THREE.AxesHelper(Math.max(size.x, size.y, size.z) * 0.6);
+        tiger.add(tigerAxesHelper);
         tigerAxesHelper.visible = params.showLocalAxes;
 
         // Create rotation gizmo rings
@@ -700,7 +701,6 @@ function onDocumentMouseDown(event) {
         if (controls) controls.enabled = false;
 
         // Compute ring center in world
-        const L = hit.object.position.clone().applyMatrix4(hit.object.matrixWorld.clone().multiply(new THREE.Matrix4().makeTranslation(0,0,0)));
         const center = hit.object.getWorldPosition(new THREE.Vector3());
 
         // Axis in world
