@@ -25,6 +25,9 @@ let rotationAxisLine = null;
 let baseMergedGeometry = null; // before orientation/alignment
 let lastColorUpdate = 0;
 const targetColorFPS = 45; // throttle color recomputation if needed
+const STORAGE_KEY = 'pctiger.params.v1';
+const GUI_STATE_KEY = 'pctiger.guiState.v1';
+let loadedParamsKeys = new Set();
 
 // Local axes + gizmo
 let tigerAxesHelper = null;
@@ -92,6 +95,8 @@ const palettes = {
 const pose = { x: 0, y: 0, z: 0, yawDeg: 0 };
 
 function init() {
+    // Load saved GUI params before building scene/UI
+    loadSavedParams();
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111111);
 
@@ -140,10 +145,11 @@ function init() {
         box.getSize(size);
 
         const maxDim = Math.max(size.x, size.y, size.z);
-        // Default visual scale
-        const pointSize = Math.max(maxDim * 0.0015, 0.0025);
-        params.pointSize = pointSize;
-        params.pointCount = Math.min(60000, Math.max(8000, Math.floor((size.x * size.y + size.z * size.x + size.y * size.z) * 120)));
+        // Default visual scale (respect saved overrides)
+        const recommendedSize = Math.max(maxDim * 0.0015, 0.0025);
+        const recommendedCount = Math.min(60000, Math.max(8000, Math.floor((size.x * size.y + size.z * size.x + size.y * size.z) * 120)));
+        if (!loadedParamsKeys.has('pointSize')) params.pointSize = recommendedSize;
+        if (!loadedParamsKeys.has('pointCount')) params.pointCount = recommendedCount;
 
         cpuPointsMaterial = new THREE.PointsMaterial({
             color: new THREE.Color(params.color),
@@ -250,6 +256,10 @@ function init() {
     document.addEventListener('mousemove', onDocumentMouseMove, false);
     document.addEventListener('mousedown', onDocumentMouseDown, false);
     document.addEventListener('mouseup', onDocumentMouseUp, false);
+    const saveAll = () => { if (window._pctigerSaveHook) window._pctigerSaveHook(); else saveParams(); };
+    window.addEventListener('beforeunload', saveAll, false);
+    window.addEventListener('pagehide', saveAll, false);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) saveAll(); }, false);
 
     animate();
 }
@@ -490,6 +500,9 @@ function rebuildPointCloud(mergedGeometry) {
 function setupGUI(mergedGeometry) {
     const gui = new GUI();
     gui.title('Tiger Controls');
+    // Restore main GUI open/closed state
+    const savedGuiState = loadGuiState();
+    if (savedGuiState && savedGuiState.closed) gui.close();
 
     gui.add(params, 'pointCount', 2000, 150000, 1000)
         .name('Density (points)')
@@ -640,6 +653,39 @@ function setupGUI(mergedGeometry) {
     poseFolder.add(pose, 'y').name('Y').listen();
     poseFolder.add(pose, 'z').name('Z').listen();
     poseFolder.add(pose, 'yawDeg').name('Yaw (deg)').listen();
+
+    // Apply saved folder collapsed states
+    if (savedGuiState && savedGuiState.folders) {
+        const F = savedGuiState.folders;
+        try {
+            if (F.Stripes) stripes.close(); else stripes.open();
+            if (F.Orientation) orientFolder.close(); else orientFolder.open();
+            if (F.OrientationManipulator) manipFolder.close(); else manipFolder.open();
+            if (F.Wobble) wobbleFolder.close(); else wobbleFolder.open();
+            if (F.Gait) gaitFolder.close(); else gaitFolder.open();
+            if (F.Floor) floorFolder.close(); else floorFolder.open();
+        } catch (e) { console.warn('Failed to apply GUI folder state', e); }
+    }
+
+    // Save GUI state whenever we save params
+    const origSave = saveParams;
+    window._pctigerSaveHook = () => {
+        try {
+            const gs = {
+                closed: !!gui._closed,
+                folders: {
+                    Stripes: !!stripes._closed,
+                    Orientation: !!orientFolder._closed,
+                    OrientationManipulator: !!manipFolder._closed,
+                    Wobble: !!wobbleFolder._closed,
+                    Gait: !!gaitFolder._closed,
+                    Floor: !!floorFolder._closed,
+                }
+            };
+            localStorage.setItem(GUI_STATE_KEY, JSON.stringify(gs));
+        } catch (e) { /* ignore */ }
+        origSave();
+    };
 }
 
 function axisStringToVector(s) {
@@ -1109,3 +1155,37 @@ function onDocumentMouseMove(event) {
 }
 
 init();
+
+// --- Persistence ---
+function saveParams() {
+    try {
+        const toSave = { ...params };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+    } catch (e) { console.warn('Failed to save params', e); }
+}
+
+function loadSavedParams() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (!data || typeof data !== 'object') return;
+        for (const k in params) {
+            if (Object.prototype.hasOwnProperty.call(data, k)) {
+                const v = data[k];
+                if (typeof v === typeof params[k]) params[k] = v;
+                loadedParamsKeys.add(k);
+            }
+        }
+    } catch (e) { console.warn('Failed to load saved params', e); }
+}
+
+function loadGuiState() {
+    try {
+        const raw = localStorage.getItem(GUI_STATE_KEY);
+        if (!raw) return null;
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
