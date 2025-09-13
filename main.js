@@ -76,6 +76,7 @@ const params = {
     wobbleIntensityMult: 2.0,
     wobbleRadiusMult: 1.2,
     wobbleNoiseSpeed: 1.6,
+    wobbleSizeBoost: 2.5,
     // Simple gait
     gaitEnabled: true,
     gaitBobAmp: 0.03,
@@ -271,6 +272,10 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    // keep shader point size scaling consistent across DPR changes
+    if (tiger && tiger.material && tiger.material.uniforms && tiger.material.uniforms.uPixelRatio) {
+        tiger.material.uniforms.uPixelRatio.value = window.devicePixelRatio || 1;
+    }
 }
 
 // Walking motion across a range
@@ -571,6 +576,8 @@ function setupGUI(mergedGeometry) {
             if (tiger) {
                 if ('size' in tiger.material) tiger.material.size = v;
                 if (tiger.material.uniforms && tiger.material.uniforms.uSize) tiger.material.uniforms.uSize.value = v;
+                if (tiger.material.uniforms && tiger.material.uniforms.uHoverRadius) tiger.material.uniforms.uHoverRadius.value = hoverRadius;
+                if (tiger.material.uniforms && tiger.material.uniforms.uHoverAmp) tiger.material.uniforms.uHoverAmp.value = wobbleIntensity;
                 // Update thresholds tied to size
                 hoverRadius = Math.max(hoverRadius, v * 6);
             }
@@ -579,8 +586,18 @@ function setupGUI(mergedGeometry) {
     gui.addColor(params, 'color')
         .name('Color')
         .onChange((v) => {
-            if (tiger && !params.stripesEnabled) {
+            if (!tiger) return;
+            if (!params.stripesEnabled) {
+                // Solid color mode
                 tiger.material.color.set(v);
+            } else {
+                // Stripes mode: derive a custom palette from this color
+                setCustomPaletteFromColor(v);
+                if (params.stripesGPU) {
+                    buildPaletteTexture();
+                } else {
+                    updateStripeColors(true);
+                }
             }
         });
 
@@ -627,6 +644,10 @@ function setupGUI(mergedGeometry) {
         .name('Enable Stripes')
         .onChange((v) => {
             if (!tiger) return;
+            // When enabling stripes, always default to Tiger palette
+            if (v) {
+                params.palette = 'Tiger';
+            }
             tiger.material.vertexColors = v && !params.stripesGPU;
             tiger.material.needsUpdate = true;
             // When disabling, restore solid color
@@ -638,7 +659,12 @@ function setupGUI(mergedGeometry) {
             } else {
                 // ensure color attribute exists and refresh colors
                 ensureColorAttribute();
-                updateStripeColors(true);
+                if (params.stripesGPU) {
+                    buildPaletteTexture();
+                    switchStripesMaterial(true);
+                } else {
+                    updateStripeColors(true);
+                }
             }
         });
     stripes.add(params, 'stripesGPU')
@@ -697,6 +723,8 @@ function setupGUI(mergedGeometry) {
     wobbleFolder.add(params, 'wobbleIntensityMult', 0.2, 5, 0.1).name('Intensity x');
     wobbleFolder.add(params, 'wobbleRadiusMult', 0.5, 3, 0.1).name('Radius x');
     wobbleFolder.add(params, 'wobbleNoiseSpeed', 0, 4, 0.1).name('Noise Speed');
+    wobbleFolder.add(params, 'wobbleSizeBoost', 0, 6, 0.1).name('Size Boost')
+        .onChange((v)=>{ if (tiger && tiger.material && tiger.material.uniforms && tiger.material.uniforms.uHoverSizeBoost) tiger.material.uniforms.uHoverSizeBoost.value = v; });
 
     const gaitFolder = gui.addFolder('Gait');
     gaitFolder.add(params, 'gaitEnabled').name('Enable Gait');
@@ -1115,17 +1143,51 @@ function buildGPUStripesMaterial() {
         uSoftness: { value: params.stripeSoftness },
         uSize: { value: params.pointSize },
         uPalette: { value: paletteTexture },
+        // Wobble uniforms (hover-driven)
+        uHover: { value: new THREE.Vector3(0,0,0) },
+        uHoverActive: { value: 0.0 },
+        uHoverRadius: { value: hoverRadius || 0.2 },
+        uHoverAmp: { value: wobbleIntensity || 0.05 },
+        uHoverSizeBoost: { value: 2.5 },
+        uPixelRatio: { value: (typeof window !== 'undefined' ? window.devicePixelRatio : 1) },
     };
 
     const vertexShader = `
         attribute float aStripe;
         uniform float uSize;
+        uniform vec3 uHover;
+        uniform float uHoverActive;
+        uniform float uHoverRadius;
+        uniform float uHoverAmp;
+        uniform float uTime;
+        uniform float uPixelRatio;
+        uniform float uHoverSizeBoost;
         varying float vStripe;
         varying vec3 vWorldPos;
         void main() {
             vStripe = aStripe;
-            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-            gl_PointSize = uSize * (300.0 / -mvPosition.z);
+            vec3 pos = position;
+            float sizeBoost = 0.0;
+            // Hover wobble in local space with smooth radial falloff and coherent dir
+            if (uHoverActive > 0.5) {
+                vec3 dp = pos - uHover;
+                float d = length(dp);
+                if (d < uHoverRadius) {
+                    float w = 1.0 - smoothstep(0.0, uHoverRadius, d);
+                    // Cheap coherent direction and time variation
+                    float s1 = sin(dot(pos, vec3(12.9898,78.233,37.719)) + uTime * 4.0);
+                    vec3 dir = normalize(vec3(
+                        sin(pos.x*1.3 + 0.0),
+                        sin(pos.y*1.7 + 1.0),
+                        sin(pos.z*1.9 + 2.0)
+                    ));
+                    pos += dir * (uHoverAmp * w * s1);
+                    sizeBoost = uHoverSizeBoost * w;
+                }
+            }
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            float perspective = 300.0 / max(0.001, -mvPosition.z);
+            gl_PointSize = max(1.0, uSize * perspective * uPixelRatio) * (1.0 + sizeBoost);
             gl_Position = projectionMatrix * mvPosition;
             vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;
         }
@@ -1167,6 +1229,13 @@ function switchStripesMaterial(useGPU) {
         if (tiger.material.uniforms && tiger.material.uniforms.uSize) {
             tiger.material.uniforms.uSize.value = params.pointSize;
         }
+        // Sync wobble uniforms to current values
+        if (tiger.material.uniforms) {
+            tiger.material.uniforms.uHoverRadius.value = hoverRadius || tiger.material.uniforms.uHoverRadius.value;
+            tiger.material.uniforms.uHoverAmp.value = wobbleIntensity || tiger.material.uniforms.uHoverAmp.value;
+            if (tiger.material.uniforms.uHoverSizeBoost) tiger.material.uniforms.uHoverSizeBoost.value = params.wobbleSizeBoost;
+            if (tiger.material.uniforms.uPixelRatio) tiger.material.uniforms.uPixelRatio.value = window.devicePixelRatio || 1;
+        }
         tiger.material.needsUpdate = true;
         // GPU uses color in shader; ensure attribute exists
         if (!tiger.geometry.getAttribute('aStripe') && stripeCoord) {
@@ -1181,6 +1250,18 @@ function switchStripesMaterial(useGPU) {
         tiger.material.vertexColors = params.stripesEnabled;
         tiger.material.needsUpdate = true;
         updateStripeColors(true);
+    }
+}
+
+function setCustomPaletteFromColor(hex) {
+    try {
+        const c = new THREE.Color(hex);
+        const dark = new THREE.Color(c.r * 0.15, c.g * 0.15, c.b * 0.15);
+        const mid = new THREE.Color(c.r * 0.5, c.g * 0.5, c.b * 0.5);
+        palettes.Custom = [ '#' + dark.getHexString(), '#' + c.getHexString(), '#' + mid.getHexString(), '#' + c.getHexString() ];
+        params.palette = 'Custom';
+    } catch (e) {
+        console.warn('Failed to build custom palette', e);
     }
 }
 
@@ -1209,8 +1290,18 @@ function onDocumentMouseMove(event) {
         const hit = intersects[0];
         const p = hit.point.clone(); // world space
         hoverPointLocal = tiger.worldToLocal(p);
+        // Feed GPU wobble uniforms when stripes shader is active
+        if (params.stripesEnabled && params.stripesGPU && tiger.material && tiger.material.uniforms) {
+            tiger.material.uniforms.uHover.value.copy(hoverPointLocal);
+            tiger.material.uniforms.uHoverActive.value = 1.0;
+            tiger.material.uniforms.uHoverRadius.value = hoverRadius;
+            tiger.material.uniforms.uHoverAmp.value = wobbleIntensity;
+        }
     } else {
         hoverPointLocal = null;
+        if (params.stripesEnabled && params.stripesGPU && tiger.material && tiger.material.uniforms) {
+            tiger.material.uniforms.uHoverActive.value = 0.0;
+        }
     }
 }
 
