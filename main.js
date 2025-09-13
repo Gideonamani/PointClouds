@@ -281,8 +281,8 @@ let walkStarted = false; // start after formation
 let isTurning = false;
 let turnStart = 0;
 let turnFrom = 0;
-let turnTo = 0;
-const turnDuration = 0.5; // seconds
+let turnDelta = 0;
+const turnDuration = 1.5; // seconds
 let gaitPhase = 0; // cycles advance with time when walking
 
 function animate() {
@@ -439,22 +439,23 @@ function animate() {
             isTurning = true;
             turnStart = performance.now();
             turnFrom = tigerGroup.rotation.y;
-            turnTo = Math.PI;
+            turnDelta = Math.PI; // always turn same direction
         } else if (!isTurning && tigerGroup.position.x < -walkRange) {
             tigerGroup.position.x = -walkRange;
             isTurning = true;
             turnStart = performance.now();
             turnFrom = tigerGroup.rotation.y;
-            turnTo = 0;
+            turnDelta = Math.PI; // always turn same direction
         }
         if (isTurning) {
             const t = Math.min(1, (performance.now() - turnStart) / (turnDuration * 1000));
             const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // easeInOutQuad
-            tigerGroup.rotation.y = THREE.MathUtils.lerp(turnFrom, turnTo, ease);
+            const yaw = turnFrom + turnDelta * ease;
+            tigerGroup.rotation.y = normalizeAngle(yaw);
             if (t >= 1) {
                 isTurning = false;
-                walkDirection = (turnTo === 0) ? 1 : -1;
-                tigerGroup.rotation.y = turnTo;
+                walkDirection = (walkDirection === 1) ? -1 : 1;
+                tigerGroup.rotation.y = normalizeAngle(turnFrom + turnDelta);
             }
         }
         // Procedural gait translation components (bob/sway)
@@ -475,10 +476,17 @@ function animate() {
 
     if (controls) controls.update();
 
-    renderer.render(scene, camera);
+renderer.render(scene, camera);
 }
 
 // --- Helpers ---
+
+function normalizeAngle(a) {
+    const TAU = Math.PI * 2;
+    a = a % TAU;
+    if (a < 0) a += TAU;
+    return a;
+}
 
 function samplePointsFromGeometry(geometry, count) {
     const mesh = new THREE.Mesh(geometry);
