@@ -82,6 +82,9 @@ const params = {
     gaitSwayAmp: 0.02,
     gaitPitchAmpDeg: 2.0,
     gaitFreq: 1.2,
+    gaitHeadBobAmp: 0.02,
+    gaitTailSwayAmp: 0.02,
+    gaitFrontSplit: 0.55,
 };
 
 // Predefined color palettes
@@ -275,6 +278,12 @@ let walkDirection = 1;
 let walkRange = 0; // set after load via cameraZ or model size
 let walkSpeed = 0; // units per second
 let walkStarted = false; // start after formation
+let isTurning = false;
+let turnStart = 0;
+let turnFrom = 0;
+let turnTo = 0;
+const turnDuration = 0.5; // seconds
+let gaitPhase = 0; // cycles advance with time when walking
 
 function animate() {
     requestAnimationFrame(animate);
@@ -295,7 +304,14 @@ function animate() {
         const formationExplode = 1 - e; // 1 at start, 0 when formed
         const fEff = Math.max(formationExplode, params.explode);
 
-        // Update positions toward base (lerp of original and start)
+        // Precompute gait offsets (head/tail) for this frame
+        let headBobY = 0, tailSwayZ = 0;
+        if (params.gaitEnabled) {
+            headBobY = Math.sin(gaitPhase * Math.PI * 2) * params.gaitHeadBobAmp;
+            tailSwayZ = Math.sin(gaitPhase * Math.PI * 2 + Math.PI * 0.5) * params.gaitTailSwayAmp;
+        }
+
+        // Update positions toward base (lerp of original and start), then apply gait offsets
         let updated = false;
         if (hoverPointLocal) {
             const hx = hoverPointLocal.x;
@@ -309,9 +325,18 @@ function animate() {
                 const sx = startVertices ? startVertices[i] : ox;
                 const sy = startVertices ? startVertices[i + 1] : oy;
                 const sz = startVertices ? startVertices[i + 2] : oz;
-                const bx = ox + (sx - ox) * fEff;
-                const by = oy + (sy - oy) * fEff;
-                const bz = oz + (sz - oz) * fEff;
+                let bx = ox + (sx - ox) * fEff;
+                let by = oy + (sy - oy) * fEff;
+                let bz = oz + (sz - oz) * fEff;
+                // Apply head/tail offsets based on stripe (x) coordinate
+                if (params.gaitEnabled && stripeCoord) {
+                    const sIdx = (i / 3) | 0;
+                    const s = stripeCoord[sIdx];
+                    const headW = Math.max(0, (s - params.gaitFrontSplit)) / Math.max(1e-6, 1 - params.gaitFrontSplit);
+                    const tailW = 1 - headW;
+                    by += headBobY * headW;
+                    bz += tailSwayZ * tailW;
+                }
                 const dx = bx - hx;
                 const dy = by - hy;
                 const dz = bz - hz;
@@ -349,9 +374,17 @@ function animate() {
                 const sx = startVertices ? startVertices[i] : ox;
                 const sy = startVertices ? startVertices[i + 1] : oy;
                 const sz = startVertices ? startVertices[i + 2] : oz;
-                const bx = ox + (sx - ox) * fEff;
-                const by = oy + (sy - oy) * fEff;
-                const bz = oz + (sz - oz) * fEff;
+                let bx = ox + (sx - ox) * fEff;
+                let by = oy + (sy - oy) * fEff;
+                let bz = oz + (sz - oz) * fEff;
+                if (params.gaitEnabled && stripeCoord) {
+                    const sIdx = (i / 3) | 0;
+                    const s = stripeCoord[sIdx];
+                    const headW = Math.max(0, (s - params.gaitFrontSplit)) / Math.max(1e-6, 1 - params.gaitFrontSplit);
+                    const tailW = 1 - headW;
+                    by += headBobY * headW;
+                    bz += tailSwayZ * tailW;
+                }
                 arr[i] += (bx - arr[i]) * Math.min(1, dt * 10);
                 arr[i + 1] += (by - arr[i + 1]) * Math.min(1, dt * 10);
                 arr[i + 2] += (bz - arr[i + 2]) * Math.min(1, dt * 10);
@@ -395,18 +428,34 @@ function animate() {
             tigerGroup.rotation.y = 0;
             walkStarted = true;
         }
-        // Start walking only after formation completes
-        if (!params.pauseWalk && formationDone) {
+        // Start walking only after formation completes and not during turning
+        if (!params.pauseWalk && formationDone && !isTurning) {
             tigerGroup.position.x += walkDirection * walkSpeed * dt;
+            if (params.gaitEnabled) gaitPhase += dt * params.gaitFreq;
         }
-        if (tigerGroup.position.x > walkRange) {
-            walkDirection = -1;
+        // Handle turning animation at bounds
+        if (!isTurning && tigerGroup.position.x > walkRange) {
             tigerGroup.position.x = walkRange;
-            tigerGroup.rotation.y = Math.PI; // face back
-        } else if (tigerGroup.position.x < -walkRange) {
-            walkDirection = 1;
+            isTurning = true;
+            turnStart = performance.now();
+            turnFrom = tigerGroup.rotation.y;
+            turnTo = Math.PI;
+        } else if (!isTurning && tigerGroup.position.x < -walkRange) {
             tigerGroup.position.x = -walkRange;
-            tigerGroup.rotation.y = 0;
+            isTurning = true;
+            turnStart = performance.now();
+            turnFrom = tigerGroup.rotation.y;
+            turnTo = 0;
+        }
+        if (isTurning) {
+            const t = Math.min(1, (performance.now() - turnStart) / (turnDuration * 1000));
+            const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // easeInOutQuad
+            tigerGroup.rotation.y = THREE.MathUtils.lerp(turnFrom, turnTo, ease);
+            if (t >= 1) {
+                isTurning = false;
+                walkDirection = (turnTo === 0) ? 1 : -1;
+                tigerGroup.rotation.y = turnTo;
+            }
         }
         // Procedural gait translation components (bob/sway)
         if (params.gaitEnabled) {
@@ -647,6 +696,9 @@ function setupGUI(mergedGeometry) {
     gaitFolder.add(params, 'gaitSwayAmp', 0, 0.2, 0.005).name('Sway Amp');
     gaitFolder.add(params, 'gaitPitchAmpDeg', 0, 10, 0.1).name('Pitch Amp (deg)');
     gaitFolder.add(params, 'gaitFreq', 0, 3, 0.05).name('Gait Freq');
+    gaitFolder.add(params, 'gaitHeadBobAmp', 0, 0.2, 0.005).name('Head Bob (front)');
+    gaitFolder.add(params, 'gaitTailSwayAmp', 0, 0.2, 0.005).name('Tail Sway (rear)');
+    gaitFolder.add(params, 'gaitFrontSplit', 0.2, 0.9, 0.01).name('Front Split');
 
     const poseFolder = gui.addFolder('Pose (read-only)');
     poseFolder.add(pose, 'x').name('X').listen();
