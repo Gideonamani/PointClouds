@@ -46,6 +46,7 @@ This file tracks the features we want to implement for the point cloud tiger ani
 - 2025-09-14 — Fixed startup teleport by gating gait (pitch/bob/sway) and walking until formation completes; start position now set at load.
 - 2025-09-14 — Removed post-formation reposition and set left-edge start position during model load to eliminate the visible jolt.
 - 2025-09-14 — Stopped OrbitControls zoom while using GUI (wheel capture + hover disable) and pre-converted geometry to non-indexed before sampling to silence MeshSurfaceSampler warnings.
+- 2025-09-14 — Separated grid and world axes controls; world axes origin now follows floor height; added optional grassy floor (shader) with Floor Style selector.
 
 How to use:
 - Log every meaningful change with a new line in Build Info using the format: YYYY-MM-DD — short description (newest first).

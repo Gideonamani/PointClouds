@@ -36,6 +36,9 @@ let gizmoRings = { x: null, y: null, z: null };
 let isDraggingGizmo = false;
 let activeAxis = null; // 'x' | 'y' | 'z' | null
 let dragStartInfo = null; // { axis: 'x', center: Vector3, axisWorld: Vector3, startVec: Vector3, startRot: {x,y,z} }
+// Floor (optional grassy plane)
+let floorMesh = null;
+let grassMaterial = null;
 // Base orientation (from params) used every frame, gait adds on top
 let baseRot = { x: 0, y: 0, z: 0 }; // radians
 // Materials/textures for GPU stripes
@@ -52,11 +55,13 @@ const params = {
     pauseWalk: false,
     rotationSpeed: 0.0, // rad/s applied to tiger (not group yaw)
     showGrid: true,
+    showWorldAxes: true,
     explode: 0.0, // 0 formed .. 1 fully exploded
     showRotationAxis: true,
     showLocalAxes: true,
     showGizmo: true,
     floorHeight: -0.97,
+    floorStyle: 'Grid', // 'Grid' | 'Grass'
     modelUp: '+Y',
     modelForward: '+X',
     // Stripes
@@ -190,8 +195,14 @@ function init() {
             scene.add(axesHelper);
             helpersAdded = true;
         }
-        if (gridHelper) gridHelper.visible = params.showGrid;
-        if (axesHelper) axesHelper.visible = params.showGrid;
+        if (gridHelper) gridHelper.visible = params.showGrid && params.floorStyle === 'Grid';
+        if (axesHelper) {
+            axesHelper.visible = params.showWorldAxes;
+            axesHelper.position.y = params.floorHeight || 0;
+        }
+
+        // Create/update grassy floor (optional)
+        createOrUpdateGrassFloor(Math.max(size.x, size.y, size.z) * 6);
 
         // Store original vertices (targets) for wobble/formation
         const posAttr = tiger.geometry.getAttribute('position');
@@ -627,11 +638,11 @@ function setupGUI(mergedGeometry) {
         .name('Explode');
 
     gui.add(params, 'showGrid')
-        .name('Show Grid/Axes')
-        .onChange((v) => {
-            if (gridHelper) gridHelper.visible = v;
-            if (axesHelper) axesHelper.visible = v;
-        });
+        .name('Show Grid')
+        .onChange((v) => { if (gridHelper) gridHelper.visible = v && params.floorStyle === 'Grid'; });
+    gui.add(params, 'showWorldAxes')
+        .name('Show World Axes')
+        .onChange((v) => { if (axesHelper) axesHelper.visible = v; });
 
     gui.add(params, 'showRotationAxis')
         .name('Show Rotation Axis')
@@ -646,9 +657,19 @@ function setupGUI(mergedGeometry) {
         .onChange((v) => { if (gizmoGroup) gizmoGroup.visible = v; });
 
     const floorFolder = gui.addFolder('Floor');
+    floorFolder.add(params, 'floorStyle', ['Grid','Grass'])
+        .name('Floor Style')
+        .onChange((style) => {
+            if (gridHelper) gridHelper.visible = params.showGrid && style === 'Grid';
+            if (floorMesh) floorMesh.visible = style === 'Grass';
+        });
     floorFolder.add(params, 'floorHeight', -5, 5, 0.01)
         .name('Floor Height (Y)')
-        .onChange((v) => { if (gridHelper) gridHelper.position.y = v; });
+        .onChange((v) => {
+            if (gridHelper) gridHelper.position.y = v;
+            if (axesHelper) axesHelper.position.y = v;
+            if (floorMesh) floorMesh.position.y = v;
+        });
     floorFolder.add({ snap: () => snapFloorToTiger() }, 'snap').name('Snap To Tiger');
 
     const stripes = gui.addFolder('Stripes');
@@ -864,6 +885,65 @@ function createOrUpdateRotationAxisLine() {
         rotationAxisLine.computeLineDistances();
     }
     rotationAxisLine.visible = params.showRotationAxis;
+}
+
+function createOrUpdateGrassFloor(span) {
+    // span ~ scene size (x/z)
+    const size = Math.max(10, span);
+    if (!grassMaterial) {
+        const uniforms = {
+            uColor1: { value: new THREE.Color('#184d27') },
+            uColor2: { value: new THREE.Color('#2f8f2f') },
+            uScale:  { value: 0.2 },
+        };
+        const vtx = `
+            varying vec2 vUv;
+            void main(){
+                vUv = uv * 10.0; // tile
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+            }
+        `;
+        const frg = `
+            precision mediump float;
+            varying vec2 vUv;
+            uniform vec3 uColor1, uColor2;
+            uniform float uScale;
+            // simple value noise
+            float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+            float noise(vec2 p){
+              vec2 i=floor(p), f=fract(p);
+              float a=hash(i);
+              float b=hash(i+vec2(1.0,0.0));
+              float c=hash(i+vec2(0.0,1.0));
+              float d=hash(i+vec2(1.0,1.0));
+              vec2 u=f*f*(3.0-2.0*f);
+              return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+            }
+            void main(){
+              float n = noise(vUv * (4.0/uScale)) * 0.6 + noise(vUv * (8.0/uScale)) * 0.4;
+              n = smoothstep(0.2, 0.8, n);
+              vec3 col = mix(uColor1, uColor2, n);
+              gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+        grassMaterial = new THREE.ShaderMaterial({ vertexShader: vtx, fragmentShader: frg });
+    }
+    if (!floorMesh) {
+        const geo = new THREE.PlaneGeometry(size, size, 1, 1);
+        floorMesh = new THREE.Mesh(geo, grassMaterial);
+        floorMesh.rotation.x = -Math.PI / 2;
+        floorMesh.position.y = params.floorHeight || 0;
+        scene.add(floorMesh);
+    } else {
+        // Resize if needed
+        const need = Math.max(floorMesh.geometry.parameters.width, floorMesh.geometry.parameters.height);
+        if (Math.abs(need - size) > 1e-3) {
+            floorMesh.geometry.dispose();
+            floorMesh.geometry = new THREE.PlaneGeometry(size, size, 1, 1);
+        }
+        floorMesh.position.y = params.floorHeight || 0;
+    }
+    floorMesh.visible = params.floorStyle === 'Grass';
 }
 
 function createOrUpdateGizmo(maxDim) {
