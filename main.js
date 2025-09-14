@@ -25,6 +25,12 @@ let rotationAxisLine = null;
 let baseMergedGeometry = null; // before orientation/alignment
 let lastColorUpdate = 0;
 const targetColorFPS = 45; // throttle color recomputation if needed
+// View cube overlay
+let viewCubeScene = null;
+let viewCubeCamera = null;
+let viewCube = null;
+let viewCubeCorners = [];
+const viewCubeState = { sizePx: 120, marginPx: 12 };
 const STORAGE_KEY = 'pctiger.params.v1';
 const GUI_STATE_KEY = 'pctiger.guiState.v1';
 let loadedParamsKeys = new Set();
@@ -329,6 +335,8 @@ function init() {
     window.addEventListener('pagehide', saveAll, false);
     document.addEventListener('visibilitychange', () => { if (document.hidden) saveAll(); }, false);
 
+    // Init view cube overlay
+    initViewCube();
     animate();
 }
 
@@ -340,6 +348,8 @@ function onWindowResize() {
     if (tiger && tiger.material && tiger.material.uniforms && tiger.material.uniforms.uPixelRatio) {
         tiger.material.uniforms.uPixelRatio.value = window.devicePixelRatio || 1;
     }
+    // Adjust view cube size on DPI changes
+    updateViewCubeViewport();
 }
 
 // Walking motion across a range
@@ -351,7 +361,7 @@ let isTurning = false;
 let turnStart = 0;
 let turnFrom = 0;
 let turnDelta = 0;
-const turnDuration = 1.5; // seconds
+const turnDuration = 10.5; // seconds
 let gaitPhase = 0; // cycles advance with time when walking
 
 function animate() {
@@ -539,7 +549,10 @@ function animate() {
 
     if (controls) controls.update();
 
-renderer.render(scene, camera);
+    renderer.render(scene, camera);
+
+    // Render view cube overlay
+    renderViewCube();
 }
 
 // --- Helpers ---
@@ -549,6 +562,143 @@ function normalizeAngle(a) {
     a = a % TAU;
     if (a < 0) a += TAU;
     return a;
+}
+
+// --- View Cube Overlay ---
+function initViewCube() {
+    const dpr = window.devicePixelRatio || 1;
+    if (!viewCubeScene) viewCubeScene = new THREE.Scene();
+    const size = 1.0;
+    const geo = new THREE.BoxGeometry(size, size, size);
+    const mat = new THREE.MeshNormalMaterial({ flatShading: true });
+    viewCube = new THREE.Mesh(geo, mat);
+    viewCubeScene.add(viewCube);
+    // Corner spheres for diagonals
+    const cornerDirs = [
+        new THREE.Vector3(1, 1, 1),
+        new THREE.Vector3(-1, 1, 1),
+        new THREE.Vector3(1, 1, -1),
+        new THREE.Vector3(-1, 1, -1),
+    ];
+    const sGeo = new THREE.SphereGeometry(0.12, 12, 12);
+    const sMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    viewCubeCorners = cornerDirs.map((v) => {
+        const m = new THREE.Mesh(sGeo, sMat);
+        m.position.copy(v.clone().normalize().multiplyScalar(0.85));
+        m.userData.isoDir = v.clone().normalize();
+        viewCubeScene.add(m);
+        return m;
+    });
+    // Camera
+    viewCubeCamera = new THREE.PerspectiveCamera(35, 1, 0.1, 10);
+    viewCubeCamera.position.set(2, 2, 3);
+    viewCubeCamera.lookAt(0, 0, 0);
+    updateViewCubeViewport();
+
+    // Pointer handler
+    renderer.domElement.addEventListener('pointerdown', onViewCubePointerDown, { passive: false });
+}
+
+function updateViewCubeViewport() {
+    const dpr = window.devicePixelRatio || 1;
+    viewCubeState.sizePx = Math.max(80, Math.floor(110 * dpr));
+    viewCubeState.marginPx = Math.floor(12 * dpr);
+}
+
+function renderViewCube() {
+    if (!viewCubeScene || !viewCubeCamera) return;
+    // Make cube reflect camera orientation (inverse) so it shows world axes
+    if (viewCube) {
+        viewCube.quaternion.copy(camera.quaternion).invert();
+        viewCube.rotation.z = 0; // keep tidy
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const w = renderer.domElement.width;   // drawing buffer px
+    const h = renderer.domElement.height;
+    const vpSize = viewCubeState.sizePx;
+    const vpX = viewCubeState.marginPx;
+    const vpY = viewCubeState.marginPx; // bottom-left
+    // Setup scissor/viewport
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    renderer.setScissorTest(true);
+    renderer.setViewport(vpX, vpY, vpSize, vpSize);
+    renderer.setScissor(vpX, vpY, vpSize, vpSize);
+    viewCubeCamera.aspect = 1;
+    viewCubeCamera.updateProjectionMatrix();
+    renderer.render(viewCubeScene, viewCubeCamera);
+    // Restore full-canvas viewport/scissor for next frame
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, renderer.domElement.width, renderer.domElement.height);
+    renderer.setScissor(0, 0, renderer.domElement.width, renderer.domElement.height);
+    renderer.autoClear = true;
+}
+
+function onViewCubePointerDown(e) {
+    if (!viewCubeScene || !viewCubeCamera) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const mx = (e.clientX - rect.left) * dpr;
+    const my = (e.clientY - rect.top) * dpr;
+    const canvasW = renderer.domElement.width;
+    const canvasH = renderer.domElement.height;
+    const vpSize = viewCubeState.sizePx;
+    const vpX = viewCubeState.marginPx;
+    const vpY = viewCubeState.marginPx;
+    const myFromBottom = canvasH - my;
+    const within = mx >= vpX && mx <= vpX + vpSize && myFromBottom >= vpY && myFromBottom <= vpY + vpSize;
+    if (!within) return;
+
+    // Prevent orbit/scroll and handle cube click
+    e.preventDefault();
+    if (controls) controls.enabled = false;
+    setTimeout(() => { if (controls) controls.enabled = true; }, 0);
+
+    const ndc = new THREE.Vector2(
+        ( (mx - vpX) / vpSize ) * 2 - 1,
+        ( (myFromBottom - vpY) / vpSize ) * 2 - 1
+    );
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, viewCubeCamera);
+    const pick = ray.intersectObjects([viewCube, ...viewCubeCorners], true);
+    if (pick.length === 0) return;
+
+    const hit = pick[0].object;
+    if (hit.userData.isoDir) {
+        // Diagonal iso from corner sphere
+        applyViewDirection(hit.userData.isoDir.clone());
+        return;
+    }
+    // Map face normal to axis direction
+    if (pick[0].face) {
+        const n = pick[0].face.normal.clone(); // local space
+        // Convert to world of cube, then to world axes (cube not transformed except rotation)
+        viewCube.updateMatrixWorld(true);
+        const nWorld = n.applyMatrix3(new THREE.Matrix3().getNormalMatrix(viewCube.matrixWorld)).normalize();
+        // Snap to major axis
+        const ax = Math.abs(nWorld.x), ay = Math.abs(nWorld.y), az = Math.abs(nWorld.z);
+        let dir = new THREE.Vector3();
+        if (ax > ay && ax > az) dir.set(Math.sign(nWorld.x), 0, 0);
+        else if (ay > ax && ay > az) dir.set(0, Math.sign(nWorld.y), 0);
+        else dir.set(0, 0, Math.sign(nWorld.z));
+        applyViewDirection(dir);
+    }
+}
+
+function applyViewDirection(dir) {
+    if (!camera) return;
+    const target = controls ? controls.target.clone() : new THREE.Vector3(0,0,0);
+    const dist = camera.position.distanceTo(target) || 5;
+    const pos = target.clone().add(dir.clone().normalize().multiplyScalar(dist));
+    camera.up.set(0,1,0);
+    if (dir.y > 0.9) camera.up.set(0,0,1); // top view: roll for better horizon
+    if (dir.y < -0.9) camera.up.set(0,0,-1);
+    camera.position.copy(pos);
+    camera.lookAt(target);
+    if (controls) {
+        controls.target.copy(target);
+        controls.update();
+    }
 }
 
 function samplePointsFromGeometry(geometry, count) {
