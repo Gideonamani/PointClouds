@@ -47,6 +47,7 @@ This file tracks the features we want to implement for the point cloud tiger ani
 - 2025-09-14 — Removed post-formation reposition and set left-edge start position during model load to eliminate the visible jolt.
 - 2025-09-14 — Stopped OrbitControls zoom while using GUI (wheel capture + hover disable) and pre-converted geometry to non-indexed before sampling to silence MeshSurfaceSampler warnings.
 - 2025-09-14 — Separated grid and world axes controls; world axes origin now follows floor height; added optional grassy floor (shader) with Floor Style selector.
+- 2025-09-14 — Brightened grassy floor shader (double-sided, tone-mapping disabled) and added a Session → Reset To Defaults button for quick recovery to moderate selections.
 
 How to use:
 - Log every meaningful change with a new line in Build Info using the format: YYYY-MM-DD — short description (newest first).

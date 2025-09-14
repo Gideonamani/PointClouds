@@ -39,6 +39,42 @@ let dragStartInfo = null; // { axis: 'x', center: Vector3, axisWorld: Vector3, s
 // Floor (optional grassy plane)
 let floorMesh = null;
 let grassMaterial = null;
+
+// Reset defaults (moderate, safe settings)
+const DEFAULTS = Object.freeze({
+    // visuals
+    color: '#ff8800',
+    pointCount: 30000,
+    pointSize: 0.01,
+    explode: 0.0,
+    // helpers
+    showGrid: true,
+    showWorldAxes: true,
+    showRotationAxis: false,
+    showLocalAxes: false,
+    showGizmo: false,
+    floorHeight: -0.97,
+    floorStyle: 'Grid',
+    // orientation
+    rotXDeg: 105,
+    rotYDeg: -90,
+    rotZDeg: -30,
+    modelUp: '+Y',
+    modelForward: '+X',
+    // stripes
+    stripesEnabled: true,
+    stripesGPU: false,
+    stripesCount: 8,
+    rippleSpeed: 0.6,
+    rippleAmplitude: 0.4,
+    rippleWaves: 2,
+    stripeSoftness: 0.25,
+    palette: 'Tiger',
+    // motion
+    walkSpeed: 0,
+    pauseWalk: false,
+    rotationSpeed: 0.0,
+});
 // Base orientation (from params) used every frame, gait adds on top
 let baseRot = { x: 0, y: 0, z: 0 }; // radians
 // Materials/textures for GPU stripes
@@ -672,6 +708,9 @@ function setupGUI(mergedGeometry) {
         });
     floorFolder.add({ snap: () => snapFloorToTiger() }, 'snap').name('Snap To Tiger');
 
+    const session = gui.addFolder('Session');
+    session.add({ reset: () => resetToDefaults(baseMergedGeometry) }, 'reset').name('Reset To Defaults');
+
     const stripes = gui.addFolder('Stripes');
     stripes.add(params, 'stripesEnabled')
         .name('Enable Stripes')
@@ -892,9 +931,10 @@ function createOrUpdateGrassFloor(span) {
     const size = Math.max(10, span);
     if (!grassMaterial) {
         const uniforms = {
-            uColor1: { value: new THREE.Color('#184d27') },
-            uColor2: { value: new THREE.Color('#2f8f2f') },
-            uScale:  { value: 0.2 },
+            uColor1: { value: new THREE.Color('#2fa44a') },
+            uColor2: { value: new THREE.Color('#7ed957') },
+            uScale:  { value: 0.4 },
+            uBrightness: { value: 1.2 },
         };
         const vtx = `
             varying vec2 vUv;
@@ -908,6 +948,7 @@ function createOrUpdateGrassFloor(span) {
             varying vec2 vUv;
             uniform vec3 uColor1, uColor2;
             uniform float uScale;
+            uniform float uBrightness;
             // simple value noise
             float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
             float noise(vec2 p){
@@ -920,13 +961,13 @@ function createOrUpdateGrassFloor(span) {
               return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
             }
             void main(){
-              float n = noise(vUv * (4.0/uScale)) * 0.6 + noise(vUv * (8.0/uScale)) * 0.4;
-              n = smoothstep(0.2, 0.8, n);
-              vec3 col = mix(uColor1, uColor2, n);
+              float n = noise(vUv * (3.0/uScale)) * 0.5 + noise(vUv * (7.0/uScale)) * 0.5;
+              n = smoothstep(0.15, 0.85, n);
+              vec3 col = mix(uColor1, uColor2, n) * uBrightness;
               gl_FragColor = vec4(col, 1.0);
             }
         `;
-        grassMaterial = new THREE.ShaderMaterial({ vertexShader: vtx, fragmentShader: frg });
+        grassMaterial = new THREE.ShaderMaterial({ vertexShader: vtx, fragmentShader: frg, side: THREE.DoubleSide, depthWrite: true, depthTest: true, transparent: false, toneMapped: false });
     }
     if (!floorMesh) {
         const geo = new THREE.PlaneGeometry(size, size, 1, 1);
@@ -1005,10 +1046,12 @@ function applyOrientationFromParams() {
 }
 
 function snapFloorToTiger() {
-    if (!gridHelper || !tiger) return;
+    if (!tiger) return;
     const box = new THREE.Box3().setFromObject(tiger);
     const minY = box.min.y;
-    gridHelper.position.y = minY;
+    if (gridHelper) gridHelper.position.y = minY;
+    if (axesHelper) axesHelper.position.y = minY;
+    if (floorMesh) floorMesh.position.y = minY;
     params.floorHeight = minY;
 }
 
@@ -1431,4 +1474,63 @@ function loadGuiState() {
     } catch {
         return null;
     }
+}
+
+// Reset to a moderate baseline and rebuild geometry/materials
+function resetToDefaults(mergedGeometry) {
+    // Apply baseline params
+    for (const k in DEFAULTS) {
+        params[k] = DEFAULTS[k];
+    }
+
+    // Orientation + floor
+    applyOrientationFromParams();
+    if (gridHelper) {
+        gridHelper.position.y = params.floorHeight;
+        gridHelper.visible = params.showGrid && params.floorStyle === 'Grid';
+    }
+    if (axesHelper) {
+        axesHelper.position.y = params.floorHeight;
+        axesHelper.visible = params.showWorldAxes;
+    }
+    if (floorMesh) {
+        floorMesh.position.y = params.floorHeight;
+        floorMesh.visible = params.floorStyle === 'Grass';
+    }
+
+    // Rebuild point cloud using current merged geometry
+    if (mergedGeometry || baseMergedGeometry) {
+        rebuildPointCloud(mergedGeometry || baseMergedGeometry);
+    }
+
+    // Ensure material mode
+    if (tiger) {
+        if (params.stripesEnabled && params.stripesGPU && typeof switchStripesMaterial === 'function') {
+            switchStripesMaterial(true);
+        } else {
+            // CPU material with optional vertex colors
+            if (!cpuPointsMaterial) {
+                cpuPointsMaterial = new THREE.PointsMaterial({ color: params.color, size: params.pointSize, sizeAttenuation: true });
+            }
+            tiger.material = cpuPointsMaterial;
+            tiger.material.vertexColors = params.stripesEnabled && !params.stripesGPU;
+            tiger.material.needsUpdate = true;
+        }
+    }
+
+    // Reset walk placement
+    if (camera) {
+        walkRange = camera.position.z * 0.6;
+        params.walkSpeed = walkRange / 8;
+    }
+    if (tigerGroup) {
+        tigerGroup.position.x = -walkRange;
+        tigerGroup.rotation.y = 0;
+        tigerGroup.visible = true;
+    }
+
+    // Helpers
+    if (rotationAxisLine) rotationAxisLine.visible = params.showRotationAxis;
+    if (tigerAxesHelper) tigerAxesHelper.visible = params.showLocalAxes;
+    if (gizmoGroup) gizmoGroup.visible = params.showGizmo;
 }
