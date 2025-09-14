@@ -38,7 +38,12 @@ let activeAxis = null; // 'x' | 'y' | 'z' | null
 let dragStartInfo = null; // { axis: 'x', center: Vector3, axisWorld: Vector3, startVec: Vector3, startRot: {x,y,z} }
 // Floor (optional grassy plane)
 let floorMesh = null;
-let grassMaterial = null;
+let grassMaterial = null; // now MeshBasicMaterial with CanvasTexture map
+let grassTexture = null;
+let modelSpan = 1; // max dimension of oriented model
+let floorSpan = 0; // actual size of grid/grass plane
+let gridSpan = 0;  // current grid helper span
+let guiRef = null; // reference to GUI for updates
 
 // Reset defaults (moderate, safe settings)
 const DEFAULTS = Object.freeze({
@@ -98,6 +103,11 @@ const params = {
     showGizmo: true,
     floorHeight: -0.97,
     floorStyle: 'Grid', // 'Grid' | 'Grass'
+    floorSize: 2.0,     // multiplier of model span for grid/grass size
+    grassColor1: '#2fa44a',
+    grassColor2: '#7ed957',
+    grassScale: 0.5, // tiling density
+    grassBrightness: 1.4,
     modelUp: '+Y',
     modelForward: '+X',
     // Stripes
@@ -188,6 +198,8 @@ function init() {
         const box = oriented.boundingBox;
         const size = new THREE.Vector3();
         box.getSize(size);
+        modelSpan = Math.max(size.x, size.y, size.z);
+        floorSpan = modelSpan * params.floorSize;
 
         const maxDim = Math.max(size.x, size.y, size.z);
         // Default visual scale (respect saved overrides)
@@ -224,21 +236,18 @@ function init() {
 
         // Add ground grid and axes once sized
         if (!helpersAdded) {
-            gridHelper = new THREE.GridHelper(maxDim * 2, 40, 0x444444, 0x222222);
+            gridHelper = new THREE.GridHelper(floorSpan, 48, 0x666666, 0x333333);
             gridHelper.position.y = params.floorHeight || 0;
+            const mats = Array.isArray(gridHelper.material) ? gridHelper.material : [gridHelper.material];
+            mats.forEach(m => { m.transparent = true; m.opacity = 0.7; });
             scene.add(gridHelper);
-            axesHelper = new THREE.AxesHelper(maxDim * 0.6);
+            gridSpan = floorSpan;
+            axesHelper = new THREE.AxesHelper(modelSpan * 0.6);
             scene.add(axesHelper);
             helpersAdded = true;
         }
-        if (gridHelper) gridHelper.visible = params.showGrid && params.floorStyle === 'Grid';
-        if (axesHelper) {
-            axesHelper.visible = params.showWorldAxes;
-            axesHelper.position.y = params.floorHeight || 0;
-        }
-
-        // Create/update grassy floor (optional)
-        createOrUpdateGrassFloor(Math.max(size.x, size.y, size.z) * 6);
+        // Apply floor/axes visibility and sync positions in one place
+        updateFloorVisuals();
 
         // Store original vertices (targets) for wobble/formation
         const posAttr = tiger.geometry.getAttribute('position');
@@ -601,17 +610,22 @@ function rebuildPointCloud(mergedGeometry) {
     const bbox = tiger.geometry.boundingBox;
     const size = new THREE.Vector3();
     bbox.getSize(size);
-    createOrUpdateGizmo(Math.max(size.x, size.y, size.z));
+    modelSpan = Math.max(size.x, size.y, size.z);
+    floorSpan = modelSpan * params.floorSize;
+    createOrUpdateGizmo(modelSpan);
     // update floor slider dynamic range if needed
     // keep current value but clamp GUI min/max via helper folder would require recreation; omitted
     // if using GPU stripes, reapply shader material and palette
     if (params.stripesEnabled && params.stripesGPU) {
         switchStripesMaterial(true);
     }
+    // sync floor visuals to any span change
+    updateFloorVisuals();
 }
 
 function setupGUI(mergedGeometry) {
     const gui = new GUI();
+    guiRef = gui;
     gui.title('Tiger Controls');
     // Restore main GUI open/closed state
     const savedGuiState = loadGuiState();
@@ -675,10 +689,10 @@ function setupGUI(mergedGeometry) {
 
     gui.add(params, 'showGrid')
         .name('Show Grid')
-        .onChange((v) => { if (gridHelper) gridHelper.visible = v && params.floorStyle === 'Grid'; });
+        .onChange(() => { updateFloorVisuals(); });
     gui.add(params, 'showWorldAxes')
         .name('Show World Axes')
-        .onChange((v) => { if (axesHelper) axesHelper.visible = v; });
+        .onChange(() => { updateFloorVisuals(); });
 
     gui.add(params, 'showRotationAxis')
         .name('Show Rotation Axis')
@@ -693,20 +707,25 @@ function setupGUI(mergedGeometry) {
         .onChange((v) => { if (gizmoGroup) gizmoGroup.visible = v; });
 
     const floorFolder = gui.addFolder('Floor');
+    floorFolder.add(params, 'floorSize', 0.5, 6.0, 0.1)
+        .name('Floor Size (x model)')
+        .onChange((v) => { floorSpan = modelSpan * v; updateFloorVisuals(); });
     floorFolder.add(params, 'floorStyle', ['Grid','Grass'])
         .name('Floor Style')
-        .onChange((style) => {
-            if (gridHelper) gridHelper.visible = params.showGrid && style === 'Grid';
-            if (floorMesh) floorMesh.visible = style === 'Grass';
-        });
+        .onChange(() => { updateFloorVisuals(); });
     floorFolder.add(params, 'floorHeight', -5, 5, 0.01)
         .name('Floor Height (Y)')
-        .onChange((v) => {
-            if (gridHelper) gridHelper.position.y = v;
-            if (axesHelper) axesHelper.position.y = v;
-            if (floorMesh) floorMesh.position.y = v;
-        });
+        .onChange(() => { updateFloorVisuals(); });
     floorFolder.add({ snap: () => snapFloorToTiger() }, 'snap').name('Snap To Tiger');
+    // Grass controls
+    floorFolder.addColor(params, 'grassColor1').name('Grass Color A')
+        .onChange(() => { updateGrassTexture(); });
+    floorFolder.addColor(params, 'grassColor2').name('Grass Color B')
+        .onChange(() => { updateGrassTexture(); });
+    floorFolder.add(params, 'grassScale', 0.1, 2.0, 0.01).name('Grass Scale')
+        .onChange(() => { updateGrassTexture(); });
+    floorFolder.add(params, 'grassBrightness', 0.2, 3.0, 0.05).name('Grass Brightness')
+        .onChange(() => { updateGrassTexture(); });
 
     const session = gui.addFolder('Session');
     session.add({ reset: () => resetToDefaults(baseMergedGeometry) }, 'reset').name('Reset To Defaults');
@@ -926,48 +945,45 @@ function createOrUpdateRotationAxisLine() {
     rotationAxisLine.visible = params.showRotationAxis;
 }
 
-function createOrUpdateGrassFloor(span) {
-    // span ~ scene size (x/z)
-    const size = Math.max(10, span);
+function updateFloorVisuals() {
+    // Ensure grass floor exists/updated to current span
+    createOrUpdateGrassFloor();
+    // Grid visibility depends on flag and style
+    if (gridHelper) {
+        gridHelper.visible = !!(params.showGrid && params.floorStyle === 'Grid');
+        gridHelper.position.y = params.floorHeight || 0;
+        // Recreate grid if span changed
+        if (Math.abs(gridSpan - floorSpan) > 1e-3) {
+            scene.remove(gridHelper);
+            if (gridHelper.geometry) gridHelper.geometry.dispose();
+            const mats = Array.isArray(gridHelper.material) ? gridHelper.material : [gridHelper.material];
+            mats.forEach(m => m.dispose && m.dispose());
+            gridHelper = new THREE.GridHelper(floorSpan, 48, 0x666666, 0x333333);
+            const mats2 = Array.isArray(gridHelper.material) ? gridHelper.material : [gridHelper.material];
+            mats2.forEach(m => { m.transparent = true; m.opacity = 0.7; });
+            gridHelper.position.y = params.floorHeight || 0;
+            scene.add(gridHelper);
+            gridSpan = floorSpan;
+        }
+    }
+    // Grass visibility
+    if (floorMesh) {
+        floorMesh.visible = params.floorStyle === 'Grass';
+        floorMesh.position.y = params.floorHeight || 0;
+    }
+    // Axes follow floor height
+    if (axesHelper) {
+        axesHelper.visible = !!params.showWorldAxes;
+        axesHelper.position.y = params.floorHeight || 0;
+    }
+}
+
+function createOrUpdateGrassFloor() {
+    // grass matches grid span
+    const size = Math.max(2, floorSpan);
+    if (!grassTexture) grassTexture = generateGrassTexture(params);
     if (!grassMaterial) {
-        const uniforms = {
-            uColor1: { value: new THREE.Color('#2fa44a') },
-            uColor2: { value: new THREE.Color('#7ed957') },
-            uScale:  { value: 0.4 },
-            uBrightness: { value: 1.2 },
-        };
-        const vtx = `
-            varying vec2 vUv;
-            void main(){
-                vUv = uv * 10.0; // tile
-                gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
-            }
-        `;
-        const frg = `
-            precision mediump float;
-            varying vec2 vUv;
-            uniform vec3 uColor1, uColor2;
-            uniform float uScale;
-            uniform float uBrightness;
-            // simple value noise
-            float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
-            float noise(vec2 p){
-              vec2 i=floor(p), f=fract(p);
-              float a=hash(i);
-              float b=hash(i+vec2(1.0,0.0));
-              float c=hash(i+vec2(0.0,1.0));
-              float d=hash(i+vec2(1.0,1.0));
-              vec2 u=f*f*(3.0-2.0*f);
-              return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
-            }
-            void main(){
-              float n = noise(vUv * (3.0/uScale)) * 0.5 + noise(vUv * (7.0/uScale)) * 0.5;
-              n = smoothstep(0.15, 0.85, n);
-              vec3 col = mix(uColor1, uColor2, n) * uBrightness;
-              gl_FragColor = vec4(col, 1.0);
-            }
-        `;
-        grassMaterial = new THREE.ShaderMaterial({ vertexShader: vtx, fragmentShader: frg, side: THREE.DoubleSide, depthWrite: true, depthTest: true, transparent: false, toneMapped: false });
+        grassMaterial = new THREE.MeshBasicMaterial({ map: grassTexture, side: THREE.DoubleSide, toneMapped: false });
     }
     if (!floorMesh) {
         const geo = new THREE.PlaneGeometry(size, size, 1, 1);
@@ -977,14 +993,75 @@ function createOrUpdateGrassFloor(span) {
         scene.add(floorMesh);
     } else {
         // Resize if needed
-        const need = Math.max(floorMesh.geometry.parameters.width, floorMesh.geometry.parameters.height);
-        if (Math.abs(need - size) > 1e-3) {
+        const cur = floorMesh.geometry.parameters.width;
+        if (Math.abs(cur - size) > 1e-3) {
             floorMesh.geometry.dispose();
             floorMesh.geometry = new THREE.PlaneGeometry(size, size, 1, 1);
         }
         floorMesh.position.y = params.floorHeight || 0;
     }
     floorMesh.visible = params.floorStyle === 'Grass';
+}
+
+function generateGrassTexture(p) {
+    const W = 512, H = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(W, H);
+    const c1 = new THREE.Color(p.grassColor1), c2 = new THREE.Color(p.grassColor2);
+    const scale = Math.max(0.1, p.grassScale);
+    const bright = Math.max(0.2, p.grassBrightness);
+    function hash(x, y) {
+        const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+        return s - Math.floor(s);
+    }
+    function noise(x, y) {
+        const xi = Math.floor(x), yi = Math.floor(y);
+        const xf = x - xi, yf = y - yi;
+        const a = hash(xi, yi);
+        const b = hash(xi + 1, yi);
+        const c = hash(xi, yi + 1);
+        const d = hash(xi + 1, yi + 1);
+        const u = xf * xf * (3 - 2 * xf);
+        const v = yf * yf * (3 - 2 * yf);
+        return a*(1-u)*(1-v) + b*u*(1-v) + c*(1-u)*v + d*u*v;
+    }
+    let idx = 0;
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            const nx = x / W * 8 / scale;
+            const ny = y / H * 8 / scale;
+            const n = 0.5 * noise(nx, ny) + 0.5 * noise(nx*2.1, ny*2.1);
+            const t = Math.min(1, Math.max(0, (n - 0.15) / 0.7));
+            const r = (c1.r * (1 - t) + c2.r * t) * 255 * bright;
+            const g = (c1.g * (1 - t) + c2.g * t) * 255 * bright;
+            const b = (c1.b * (1 - t) + c2.b * t) * 255 * bright;
+            img.data[idx++] = Math.min(255, r);
+            img.data[idx++] = Math.min(255, g);
+            img.data[idx++] = Math.min(255, b);
+            img.data[idx++] = 255;
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = true;
+    tex.needsUpdate = true;
+    return tex;
+}
+
+function updateGrassTexture() {
+    const tex = generateGrassTexture(params);
+    if (grassTexture && grassTexture.dispose) grassTexture.dispose();
+    grassTexture = tex;
+    if (grassMaterial) {
+        grassMaterial.map = grassTexture;
+        grassMaterial.needsUpdate = true;
+    }
 }
 
 function createOrUpdateGizmo(maxDim) {
@@ -1496,6 +1573,12 @@ function resetToDefaults(mergedGeometry) {
     if (floorMesh) {
         floorMesh.position.y = params.floorHeight;
         floorMesh.visible = params.floorStyle === 'Grass';
+        if (grassMaterial && grassMaterial.uniforms) {
+            if (grassMaterial.uniforms.uColor1) grassMaterial.uniforms.uColor1.value.set(params.grassColor1);
+            if (grassMaterial.uniforms.uColor2) grassMaterial.uniforms.uColor2.value.set(params.grassColor2);
+            if (grassMaterial.uniforms.uScale) grassMaterial.uniforms.uScale.value = params.grassScale;
+            if (grassMaterial.uniforms.uBrightness) grassMaterial.uniforms.uBrightness.value = params.grassBrightness;
+        }
     }
 
     // Rebuild point cloud using current merged geometry
@@ -1533,4 +1616,13 @@ function resetToDefaults(mergedGeometry) {
     if (rotationAxisLine) rotationAxisLine.visible = params.showRotationAxis;
     if (tigerAxesHelper) tigerAxesHelper.visible = params.showLocalAxes;
     if (gizmoGroup) gizmoGroup.visible = params.showGizmo;
+
+    // Update GUI displays to reflect new params
+    if (guiRef) { try { updateGUI(guiRef); } catch (e) {} }
+}
+
+function updateGUI(gui) {
+    if (!gui) return;
+    if (gui.controllers) gui.controllers.forEach(c => c.updateDisplay && c.updateDisplay());
+    if (gui.folders) Object.values(gui.folders).forEach(f => updateGUI(f));
 }

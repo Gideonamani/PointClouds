@@ -48,6 +48,8 @@ This file tracks the features we want to implement for the point cloud tiger ani
 - 2025-09-14 — Stopped OrbitControls zoom while using GUI (wheel capture + hover disable) and pre-converted geometry to non-indexed before sampling to silence MeshSurfaceSampler warnings.
 - 2025-09-14 — Separated grid and world axes controls; world axes origin now follows floor height; added optional grassy floor (shader) with Floor Style selector.
 - 2025-09-14 — Brightened grassy floor shader (double-sided, tone-mapping disabled) and added a Session → Reset To Defaults button for quick recovery to moderate selections.
+- 2025-09-14 — Replaced grass shader with procedural CanvasTexture (MeshBasicMaterial) and added color/scale/brightness controls to ensure wide compatibility (no black floor).
+- 2025-09-14 — Unified floor sizing: grid and grass now share the same span based on model size with a Floor Size control; switching styles keeps sizes matched.
 
 How to use:
 - Log every meaningful change with a new line in Build Info using the format: YYYY-MM-DD — short description (newest first).
