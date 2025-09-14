@@ -226,8 +226,16 @@ function init() {
         wobbleIntensity = Math.max(maxDim * 0.004, params.pointSize * 0.75) * params.wobbleIntensityMult;
         hoverRadius = Math.max(maxDim * 0.06, params.pointSize * 6) * params.wobbleRadiusMult;
 
-        // Init walk speed option based on camera distance
-        params.walkSpeed = (camera.position.z * 0.6) / 8; // cross ~8s by default
+        // Init walk range and starting position based on camera distance
+        walkRange = camera.position.z * 0.6; // stays in view
+        params.walkSpeed = walkRange / 8; // cross ~8s by default
+        // Place the tiger at the left bound before formation so there's no post-formation jump
+        if (tigerGroup) {
+            tigerGroup.position.x = -walkRange;
+            tigerGroup.rotation.y = 0;
+            walkDirection = 1;
+            walkStarted = true;
+        }
 
         // Build UI
         setupGUI(baseMergedGeometry);
@@ -403,7 +411,7 @@ function animate() {
         const baseY = baseRot.y;
         const baseZ = baseRot.z;
         let addPitch = 0;
-        if (params.gaitEnabled) {
+        if (params.gaitEnabled && formationDone) {
             const phase = elapsed * params.gaitFreq * Math.PI * 2;
             addPitch = THREE.MathUtils.degToRad(Math.sin(phase) * params.gaitPitchAmpDeg);
         }
@@ -426,13 +434,7 @@ function animate() {
         }
         // sync with UI-updated speed
         walkSpeed = params.walkSpeed;
-        // After formation, set initial start position once
-        if (!walkStarted && formationDone) {
-            tigerGroup.position.x = -walkRange;
-            walkDirection = 1;
-            tigerGroup.rotation.y = 0;
-            walkStarted = true;
-        }
+        // Starting position is set during load; no reposition after formation
         // Start walking only after formation completes and not during turning
         if (!params.pauseWalk && formationDone && !isTurning) {
             tigerGroup.position.x += walkDirection * walkSpeed * dt;
@@ -464,7 +466,7 @@ function animate() {
             }
         }
         // Procedural gait translation components (bob/sway)
-        if (params.gaitEnabled) {
+        if (params.gaitEnabled && formationDone) {
             const phase = elapsed * params.gaitFreq * Math.PI * 2;
             tiger.position.y = Math.sin(phase) * params.gaitBobAmp;
             tiger.position.z = Math.sin(phase * 0.5 + Math.PI * 0.25) * params.gaitSwayAmp;
@@ -494,7 +496,9 @@ function normalizeAngle(a) {
 }
 
 function samplePointsFromGeometry(geometry, count) {
-    const mesh = new THREE.Mesh(geometry);
+    // Ensure non-indexed geometry to avoid MeshSurfaceSampler conversion warning
+    const g = geometry.index ? geometry.toNonIndexed() : geometry;
+    const mesh = new THREE.Mesh(g);
     const sampler = new MeshSurfaceSampler(mesh).build();
     const positions = new Float32Array(count * 3);
     const tempPosition = new THREE.Vector3();
@@ -565,6 +569,14 @@ function setupGUI(mergedGeometry) {
     // Restore main GUI open/closed state
     const savedGuiState = loadGuiState();
     if (savedGuiState && savedGuiState.closed) gui.close();
+
+    // Prevent OrbitControls wheel-zoom and drags when interacting with GUI
+    const guiRoot = gui.domElement;
+    if (guiRoot) {
+        guiRoot.addEventListener('wheel', (e) => { e.stopPropagation(); }, { passive: true });
+        guiRoot.addEventListener('mouseenter', () => { if (controls) controls.enabled = false; });
+        guiRoot.addEventListener('mouseleave', () => { if (controls) controls.enabled = true; });
+    }
 
     gui.add(params, 'pointCount', 2000, 150000, 1000)
         .name('Density (points)')
