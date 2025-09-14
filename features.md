@@ -22,6 +22,7 @@ This file tracks the features we want to implement for the point cloud tiger ani
 - [ ] Performance/UX tweaks (FPS stats, cap point count on slow devices, pause when tab hidden).
 - [ ] Wobble upgrade: larger radius/intensity, GPU noise field, more dramatic interaction.
 - [ ] Walking gait v1: procedural steps with foot contact, head/torso motion, turn animation.
+- [ ] View cube polish: add face labels, refine tooltips, size/position controls, show/hide toggle, better click targets, DPR scaling.
 
 ## Deferred / Backed Out (Reverted for Stability)
 
@@ -51,6 +52,7 @@ This file tracks the features we want to implement for the point cloud tiger ani
 - 2025-09-14 — Replaced grass shader with procedural CanvasTexture (MeshBasicMaterial) and added color/scale/brightness controls to ensure wide compatibility (no black floor).
 - 2025-09-14 — Unified floor sizing: grid and grass now share the same span based on model size with a Floor Size control; switching styles keeps sizes matched.
 - 2025-09-14 — Added a bottom-left View Cube overlay (click faces for Front/Back/Left/Right/Top and corner spheres for diagonal isometric views). Clicks update the camera while preserving distance.
+- 2025-09-14 — Logged follow-up: plan to polish View Cube controls (labels, tooltip text, toggles, sizing, and accessibility refinements).
 
 How to use:
 - Log every meaningful change with a new line in Build Info using the format: YYYY-MM-DD — short description (newest first).

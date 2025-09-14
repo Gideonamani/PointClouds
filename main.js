@@ -30,6 +30,7 @@ let viewCubeScene = null;
 let viewCubeCamera = null;
 let viewCube = null;
 let viewCubeCorners = [];
+let viewCubeTooltip = null;
 const viewCubeState = { sizePx: 120, marginPx: 12 };
 const STORAGE_KEY = 'pctiger.params.v1';
 const GUI_STATE_KEY = 'pctiger.guiState.v1';
@@ -597,6 +598,13 @@ function initViewCube() {
 
     // Pointer handler
     renderer.domElement.addEventListener('pointerdown', onViewCubePointerDown, { passive: false });
+    renderer.domElement.addEventListener('pointermove', onViewCubePointerMove, { passive: true });
+    renderer.domElement.addEventListener('pointerleave', () => hideViewCubeTooltip(), { passive: true });
+
+    // Tooltip DOM element
+    viewCubeTooltip = document.createElement('div');
+    viewCubeTooltip.style.cssText = 'position:fixed; pointer-events:none; background:rgba(0,0,0,0.7); color:#fff; font:12px/1.2 sans-serif; padding:6px 8px; border-radius:6px; opacity:0; transition:opacity 0.12s; z-index:1000;';
+    document.body.appendChild(viewCubeTooltip);
 }
 
 function updateViewCubeViewport() {
@@ -683,6 +691,71 @@ function onViewCubePointerDown(e) {
         else dir.set(0, 0, Math.sign(nWorld.z));
         applyViewDirection(dir);
     }
+}
+
+function onViewCubePointerMove(e) {
+    if (!viewCubeScene || !viewCubeCamera) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const mx = (e.clientX - rect.left) * dpr;
+    const my = (e.clientY - rect.top) * dpr;
+    const canvasH = renderer.domElement.height;
+    const vpSize = viewCubeState.sizePx;
+    const vpX = viewCubeState.marginPx;
+    const vpY = viewCubeState.marginPx;
+    const myFromBottom = canvasH - my;
+    const within = mx >= vpX && mx <= vpX + vpSize && myFromBottom >= vpY && myFromBottom <= vpY + vpSize;
+    if (!within) { hideViewCubeTooltip(); renderer.domElement.style.cursor=''; return; }
+
+    const ndc = new THREE.Vector2(
+        ( (mx - vpX) / vpSize ) * 2 - 1,
+        ( (myFromBottom - vpY) / vpSize ) * 2 - 1
+    );
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, viewCubeCamera);
+    const pick = ray.intersectObjects([viewCube, ...viewCubeCorners], true);
+    if (pick.length === 0) { hideViewCubeTooltip(); renderer.domElement.style.cursor=''; return; }
+
+    renderer.domElement.style.cursor='pointer';
+    const hit = pick[0].object;
+    let label = '';
+    if (hit.userData.isoDir) {
+        label = isoLabelFromDir(hit.userData.isoDir);
+    } else if (pick[0].face) {
+        const n = pick[0].face.normal.clone();
+        viewCube.updateMatrixWorld(true);
+        const nWorld = n.applyMatrix3(new THREE.Matrix3().getNormalMatrix(viewCube.matrixWorld)).normalize();
+        label = faceLabelFromNormal(nWorld);
+    }
+    if (label) showViewCubeTooltip(label, e.clientX + 10, e.clientY + 10);
+}
+
+function faceLabelFromNormal(n) {
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    if (ax > ay && ax > az) return n.x > 0 ? 'Right View' : 'Left View';
+    if (ay > ax && ay > az) return n.y > 0 ? 'Top View' : 'Bottom View';
+    return n.z > 0 ? 'Front View' : 'Back View';
+}
+
+function isoLabelFromDir(v) {
+    const parts = [];
+    if (v.y >= 0) parts.push('Top'); else parts.push('Bottom');
+    parts.push(v.z >= 0 ? 'Front' : 'Back');
+    parts.push(v.x >= 0 ? 'Right' : 'Left');
+    return 'Isometric: ' + parts.join('-');
+}
+
+function showViewCubeTooltip(text, x, y) {
+    if (!viewCubeTooltip) return;
+    viewCubeTooltip.textContent = text;
+    viewCubeTooltip.style.left = x + 'px';
+    viewCubeTooltip.style.top = y + 'px';
+    viewCubeTooltip.style.opacity = '1';
+}
+
+function hideViewCubeTooltip() {
+    if (!viewCubeTooltip) return;
+    viewCubeTooltip.style.opacity = '0';
 }
 
 function applyViewDirection(dir) {
